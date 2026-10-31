@@ -1,0 +1,21 @@
+name: qemu-vince
+on:
+  workflow_dispatch:
+jobs:
+  emulate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-arm
+      - name: Download payload
+        run: curl -sL -o vince.payload "https://github.com/zjh3215588/ios-vince/releases/download/qemu-demo/vince.payload" && ls -la vince.payload
+      - name: Run emulation
+        run: python3 tools/qemu-vince.py vince.payload out --secs 45 --cpu cortex-a53
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-vince-results
+          path: out/
