@@ -90,7 +90,9 @@ def parse_regs(text):
 
 
 def sample(q, out, t, samples):
-    q.call('stop')
+    sr = q.call('stop')
+    if 'error' in sr:
+        print(f'stop error: {sr["error"]}', file=sys.stderr)
     regs_txt = q.hmp('info registers')
     regs = parse_regs(regs_txt)
     if not regs:
@@ -107,7 +109,9 @@ def sample(q, out, t, samples):
     if os.path.exists(fb_path):
         write_png(f'{out}/fb_t{t}.png', open(fb_path, 'rb').read())
         os.unlink(fb_path)
-    q.call('cont')
+    cr = q.call('cont')
+    if 'error' in cr:
+        print(f'CONT ERROR: {cr["error"]}', file=sys.stderr)
     entry = {'t': t, 'pc': regs.get('PC', 0), 'x30': regs.get('X30', 0),
              'x29': fp, 'sp': regs.get('SP', 0)}
     chain = []
@@ -214,5 +218,6 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
+
 
 
