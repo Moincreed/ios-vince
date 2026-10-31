@@ -22,6 +22,7 @@ class QMP:
         self.s.connect(path)
         self.f = self.s.makefile('rw')
         self.f.readline()
+        self.call('qmp_capabilities')
 
     def call(self, execute, **args):
         self.f.write(json.dumps({'execute': execute, 'arguments': args}) + '\n')
@@ -213,4 +214,5 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
+
 
