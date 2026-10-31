@@ -1,29 +1,22 @@
 #!/usr/bin/env python3
-"""Boot a VINCEXNU payload (tools/mkpayload_vince.py) in QEMU's virt board.
+"""Boot a VINCEXNU payload in QEMU's virt board - with periodic CPU sampling.
 
-Adapted from ios-sweet tools/qemu-sweet.py for Xiaomi Redmi 5 Plus (MSM8953):
-- accepts both VINCEXNU and SWEETXNU payload magics
-- framebuffer @ 0x90001000, 1080x2160, 24-bpp RGB888, stride 3240
-- 4 KiB page alignment for boot_args placement (vince kernel is 4K)
-- QEMU virt with GICv2 (matches the phone's GIC-400)
-- default CPU cortex-a53
+qemu-vince.py PAYLOAD OUTDIR [--secs N] [--cpu CPU] [--sample N]
 
-  qemu-vince.py PAYLOAD OUTDIR [--secs N] [--cpu CPU]
-
-Writes into OUTDIR: fb.png (what the phone screen would show), regs.txt,
-serial.txt, qemu.log, result.json.
+Every --sample seconds: QMP stop -> info registers -> pmemsave fp-region -> cont.
+Writes OUTDIR/samples.json [{t, pc, x30, x29, sp}] and stack_t.bin dumps,
+plus the usual fb.png / regs.txt / qemu.log.
 """
-import argparse, json, os, struct, subprocess, sys, time, zlib
+import argparse, json, os, re, socket, struct, subprocess, sys, time, zlib
 
 FB_BASE, FB_W, FB_H = 0x90001000, 1080, 2160
-FB_STRIDE = FB_W * 3          # 24-bpp RGB888
-PAGE = 0x1000                 # vince kernel uses 4 KiB granule
+FB_STRIDE = FB_W * 3
+PAGE = 0x1000
 STUB_PA = 0x40200000
 BOOT_LINE_LENGTH = 608
 
 
 def build_image(payload):
-    """Return (phys_base, ram_image, boot_args_pa, entry_pa)."""
     magic, ver, nsegs = struct.unpack_from('<8sII', payload, 0)
     if magic not in (b'VINCEXNU', b'SWEETXNU') or ver != 1:
         raise SystemExit('not a VINCEXNU/SWEETXNU v1 payload')
@@ -55,52 +48,77 @@ def stub(ba_pa, entry_pa):
 def write_png(path, raw):
     rows = []
     for y in range(FB_H):
-        line = raw[y * FB_STRIDE:(y + 1) * FB_STRIDE]
-        rows.append(b'\0' + line)  # assume RGB888 in memory
+        rows.append(b'\0' + raw[y * FB_STRIDE:(y + 1) * FB_STRIDE])
     chunk = lambda t, d: struct.pack('>I', len(d)) + t + d + struct.pack('>I', zlib.crc32(t + d))
     png = b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', FB_W, FB_H, 8, 2, 0, 0, 0))
     png += chunk(b'IDAT', zlib.compress(b''.join(rows), 6)) + chunk(b'IEND', b'')
     open(path, 'wb').write(png)
 
 
-def qmp(sock_path, *cmds, pmemsave=None):
-    s = socket.socket(socket.AF_UNIX)
-    s.connect(sock_path)
-    f = s.makefile('rw')
-    f.readline()
+class QMP:
+    def __init__(self, path):
+        self.s = socket.socket(socket.AF_UNIX)
+        self.s.connect(path)
+        self.f = self.s.makefile('rw')
+        self.f.readline()
 
-    def call(execute, **args):
-        f.write(json.dumps({'execute': execute, 'arguments': args}) + '\n')
-        f.flush()
+    def call(self, execute, **args):
+        self.f.write(json.dumps({'execute': execute, 'arguments': args}) + '\n')
+        self.f.flush()
         while True:
-            r = json.loads(f.readline())
+            r = json.loads(self.f.readline())
             if 'return' in r or 'error' in r:
                 return r
 
-    call('qmp_capabilities')
-    out = []
-    for c in cmds:
-        r = call('human-monitor-command', **{'command-line': c})
-        if 'error' in r:
-            print(f'qmp {c!r}: {r["error"]}', file=sys.stderr)
-        out.append(r.get('return', ''))
-    if pmemsave:
-        r = call('pmemsave', val=pmemsave[0], size=pmemsave[1], filename=pmemsave[2])
-        if 'error' in r:
-            print(f'qmp pmemsave: {r["error"]}', file=sys.stderr)
-    s.close()
-    return out
+    def hmp(self, cmdline):
+        return self.call('human-monitor-command', **{'command-line': cmdline}).get('return', '')
+
+    def close(self):
+        self.s.close()
 
 
-import socket  # noqa: E402  (kept late to mirror upstream layout)
+def parse_regs(text):
+    regs = {}
+    for m in re.finditer(r'(PC|X\d+|SP|X29|X30)=([0-9a-fA-F]+)', text):
+        regs[m.group(1)] = int(m.group(2), 16)
+    return regs
+
+
+def sample(q, out, t, samples):
+    q.call('stop')
+    regs_txt = q.hmp('info registers')
+    regs = parse_regs(regs_txt)
+    fp = regs.get('X29', 0)
+    stack = b''
+    if fp:
+        q.call('pmemsave', val=fp, size=4096, filename=f'{out}/stack_{t}.bin')
+        stack_path = f'{out}/stack_{t}.bin'
+        if os.path.exists(stack_path):
+            stack = open(stack_path, 'rb').read()
+    q.call('cont')
+    entry = {'t': t, 'pc': regs.get('PC', 0), 'x30': regs.get('X30', 0),
+             'x29': fp, 'sp': regs.get('SP', 0)}
+    chain = []
+    f = fp
+    while stack and 0 <= f - fp < len(stack) - 16:
+        off = f - fp
+        next_fp, lr = struct.unpack_from('<2Q', stack, off)
+        chain.append(hex(lr))
+        if not next_fp or next_fp <= f:
+            break
+        f = next_fp
+    entry['chain'] = chain
+    samples.append(entry)
+    print(f'sample t={t}s pc={entry["pc"]:#x} fp={fp:#x} frames={len(chain)}', file=sys.stderr)
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Boot a VINCEXNU payload in QEMU's virt board.")
+    ap = argparse.ArgumentParser()
     ap.add_argument('payload')
     ap.add_argument('outdir')
     ap.add_argument('--secs', type=float, default=45)
     ap.add_argument('--cpu', default='cortex-a53')
+    ap.add_argument('--sample', type=float, default=0, help='sample interval seconds (0=off)')
     a = ap.parse_args()
 
     payload = open(a.payload, 'rb').read()
@@ -125,26 +143,42 @@ def main():
            '-device', f'loader,addr={STUB_PA:#x},cpu-num=0']
 
     p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
+    samples = []
     t0 = time.time()
+    next_sample = a.sample if a.sample > 0 else None
     while p.poll() is None and time.time() - t0 < a.secs:
+        el = time.time() - t0
+        if next_sample is not None and el >= next_sample:
+            try:
+                q = QMP(mon)
+                sample(q, out, int(el), samples)
+                q.close()
+            except Exception as e:
+                print(f'sample failed: {e}', file=sys.stderr)
+            next_sample += a.sample
         time.sleep(0.2)
 
     if p.poll() is None:
-        _, regs, = qmp(mon, 'stop', 'info registers', pmemsave=(FB_BASE, FB_STRIDE * FB_H, f'{out}/fb.raw'))
-        open(f'{out}/regs.txt', 'w').write(regs)
+        q = QMP(mon)
+        q.call('stop')
+        regs_txt = q.hmp('info registers')
+        open(f'{out}/regs.txt', 'w').write(regs_txt)
+        r = q.call('pmemsave', val=FB_BASE, size=FB_STRIDE * FB_H, filename=f'{out}/fb.raw')
+        if 'error' in r:
+            print(f"pmemsave: {r['error']}", file=sys.stderr)
         p.kill()
         p.wait()
         raw = open(f'{out}/fb.raw', 'rb').read()
         write_png(f'{out}/fb.png', raw)
         os.unlink(f'{out}/fb.raw')
-        result = {'status': 'captured', 'fb_bytes': len(raw)}
+        result = {'status': 'captured', 'samples': samples}
     else:
-        print(f'qemu exited early: {p.returncode}', file=sys.stderr)
         result = {'status': 'qemu_exited', 'qemu_returncode': p.returncode}
 
     open(f'{out}/result.json', 'w').write(json.dumps(result, indent=2) + '\n')
+    open(f'{out}/samples.json', 'w').write(json.dumps(samples, indent=2) + '\n')
     print(json.dumps(result), file=sys.stderr)
-    return 0 if result.get('status') == 'captured' else 1
+    return 0
 
 
 if __name__ == '__main__':
