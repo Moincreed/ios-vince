@@ -8,7 +8,7 @@ on:
 jobs:
   emulate:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - name: Install QEMU
@@ -16,7 +16,7 @@ jobs:
       - name: Download payload
         run: curl -sL -o vince.payload "https://github.com/zjh3215588/ios-vince/releases/download/qemu-demo/vince.payload" && ls -la vince.payload
       - name: Run emulation
-        run: python3 tools/qemu-vince.py vince.payload out --secs ${{ github.event.inputs.secs }} --cpu cortex-a53 --sample 15
+        run: python3 tools/qemu-vince.py vince.payload out --secs ${{ github.event.inputs.secs }} --cpu cortex-a53 --sample 10
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
