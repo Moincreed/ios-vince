@@ -1,6 +1,10 @@
 name: qemu-vince
 on:
   workflow_dispatch:
+    inputs:
+      secs:
+        description: emulation seconds
+        default: "45"
 jobs:
   emulate:
     runs-on: ubuntu-latest
@@ -12,7 +16,7 @@ jobs:
       - name: Download payload
         run: curl -sL -o vince.payload "https://github.com/zjh3215588/ios-vince/releases/download/qemu-demo/vince.payload" && ls -la vince.payload
       - name: Run emulation
-        run: python3 tools/qemu-vince.py vince.payload out --secs 45 --cpu cortex-a53
+        run: python3 tools/qemu-vince.py vince.payload out --secs ${{ github.event.inputs.secs }} --cpu cortex-a53
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
