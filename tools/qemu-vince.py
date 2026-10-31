@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Boot a VINCEXNU payload in QEMU's virt board - with periodic CPU sampling.
 
 qemu-vince.py PAYLOAD OUTDIR [--secs N] [--cpu CPU] [--sample N]
@@ -56,8 +56,9 @@ def write_png(path, raw):
 
 
 class QMP:
-    def __init__(self, path):
+    def __init__(self, path, timeout=10):
         self.s = socket.socket(socket.AF_UNIX)
+        self.s.settimeout(timeout)
         self.s.connect(path)
         self.f = self.s.makefile('rw')
         self.f.readline()
@@ -90,7 +91,7 @@ def sample(q, out, t, samples):
     regs = parse_regs(regs_txt)
     fp = regs.get('X29', 0)
     stack = b''
-    if fp:
+    if fp and fp > 0x40000000:
         q.call('pmemsave', val=fp, size=4096, filename=f'{out}/stack_{t}.bin')
         stack_path = f'{out}/stack_{t}.bin'
         if os.path.exists(stack_path):
@@ -146,16 +147,28 @@ def main():
     samples = []
     t0 = time.time()
     next_sample = a.sample if a.sample > 0 else None
+    q = None
+    fails = 0
     while p.poll() is None and time.time() - t0 < a.secs:
         el = time.time() - t0
         if next_sample is not None and el >= next_sample:
             try:
-                q = QMP(mon)
+                if q is None:
+                    q = QMP(mon)
                 sample(q, out, int(el), samples)
-                q.close()
+                fails = 0
             except Exception as e:
                 print(f'sample failed: {e}', file=sys.stderr)
-            next_sample += a.sample
+                fails += 1
+                try:
+                    if q: q.close()
+                except Exception: pass
+                q = None
+                if fails >= 3:
+                    print('sampling disabled after repeated failures', file=sys.stderr)
+                    next_sample = None
+            if next_sample is not None:
+                next_sample += a.sample
         time.sleep(0.2)
 
     if p.poll() is None:
@@ -183,3 +196,4 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
+
