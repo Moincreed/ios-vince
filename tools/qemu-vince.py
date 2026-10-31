@@ -100,11 +100,11 @@ def sample(q, out, t, samples):
     fp = regs.get('X29', 0)
     stack = b''
     if fp and fp > 0x40000000:
-        q.hmp(f'pmemsave {fp:#x} 4096 {out}/stack_{t}.bin')
+        q.call('pmemsave', val=fp, size=4096, filename=f'{out}/stack_{t}.bin')
         stack_path = f'{out}/stack_{t}.bin'
         if os.path.exists(stack_path):
             stack = open(stack_path, 'rb').read()
-    q.hmp(f'pmemsave {FB_BASE:#x} {FB_STRIDE * FB_H} {out}/fbsnap.bin')
+    q.call('pmemsave', val=FB_BASE, size=FB_STRIDE * FB_H, filename=f'{out}/fbsnap.bin')
     fb_path = f'{out}/fbsnap.bin'
     if os.path.exists(fb_path):
         write_png(f'{out}/fb_t{t}.png', open(fb_path, 'rb').read())
@@ -218,6 +218,7 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
+
 
 
 
