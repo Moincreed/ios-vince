@@ -96,6 +96,11 @@ def sample(q, out, t, samples):
         stack_path = f'{out}/stack_{t}.bin'
         if os.path.exists(stack_path):
             stack = open(stack_path, 'rb').read()
+    q.call('pmemsave', val=FB_BASE, size=FB_STRIDE * FB_H, filename=f'{out}/fbsnap_{t}.raw')
+    fb_path = f'{out}/fbsnap_{t}.raw'
+    if os.path.exists(fb_path):
+        write_png(f'{out}/fb_t{t}.png', open(fb_path, 'rb').read())
+        os.unlink(fb_path)
     q.call('cont')
     entry = {'t': t, 'pc': regs.get('PC', 0), 'x30': regs.get('X30', 0),
              'x29': fp, 'sp': regs.get('SP', 0)}
@@ -196,4 +201,5 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
+
 
