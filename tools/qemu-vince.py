@@ -1,11 +1,10 @@
 ﻿#!/usr/bin/env python3
-"""Boot a VINCEXNU payload in QEMU's virt board - with periodic CPU sampling.
+"""Boot a VINCEXNU payload in QEMU's virt board - sampling edition.
 
 qemu-vince.py PAYLOAD OUTDIR [--secs N] [--cpu CPU] [--sample N]
 
-Every --sample seconds: QMP stop -> info registers -> pmemsave fp-region -> cont.
-Writes OUTDIR/samples.json [{t, pc, x30, x29, sp}] and stack_t.bin dumps,
-plus the usual fb.png / regs.txt / qemu.log.
+Every --sample seconds: QMP stop -> info registers -> stack+fb dumps -> cont.
+Outputs: fb.png (final), regs.txt, samples.json, stack_t*.bin, fb_t*.png.
 """
 import argparse, json, os, re, socket, struct, subprocess, sys, time, zlib
 
@@ -14,6 +13,33 @@ FB_STRIDE = FB_W * 3
 PAGE = 0x1000
 STUB_PA = 0x40200000
 BOOT_LINE_LENGTH = 608
+
+
+class QMP:
+    def __init__(self, path, timeout=10):
+        self.s = socket.socket(socket.AF_UNIX)
+        self.s.settimeout(timeout)
+        self.s.connect(path)
+        self.f = self.s.makefile('rw')
+        self.f.readline()
+
+    def call(self, execute, **args):
+        self.f.write(json.dumps({'execute': execute, 'arguments': args}) + '\n')
+        self.f.flush()
+        while True:
+            line = self.f.readline()
+            if not line:
+                raise TimeoutError('QMP connection closed')
+            r = json.loads(line)
+            if 'return' in r or 'error' in r:
+                return r
+
+    def hmp(self, cmdline):
+        r = self.call('human-monitor-command', **{'command-line': cmdline})
+        if 'error' in r:
+            print(f'HMP {cmdline!r} error: {r["error"]}', file=sys.stderr)
+            return ''
+        return r.get('return', '')
 
 
 def build_image(payload):
@@ -55,32 +81,9 @@ def write_png(path, raw):
     open(path, 'wb').write(png)
 
 
-class QMP:
-    def __init__(self, path, timeout=10):
-        self.s = socket.socket(socket.AF_UNIX)
-        self.s.settimeout(timeout)
-        self.s.connect(path)
-        self.f = self.s.makefile('rw')
-        self.f.readline()
-
-    def call(self, execute, **args):
-        self.f.write(json.dumps({'execute': execute, 'arguments': args}) + '\n')
-        self.f.flush()
-        while True:
-            r = json.loads(self.f.readline())
-            if 'return' in r or 'error' in r:
-                return r
-
-    def hmp(self, cmdline):
-        return self.call('human-monitor-command', **{'command-line': cmdline}).get('return', '')
-
-    def close(self):
-        self.s.close()
-
-
 def parse_regs(text):
     regs = {}
-    for m in re.finditer(r'(PC|X\d+|SP|X29|X30)=([0-9a-fA-F]+)', text):
+    for m in re.finditer(r'(PC|X\d+|SP)=([0-9a-fA-F]+)', text):
         regs[m.group(1)] = int(m.group(2), 16)
     return regs
 
@@ -89,15 +92,17 @@ def sample(q, out, t, samples):
     q.call('stop')
     regs_txt = q.hmp('info registers')
     regs = parse_regs(regs_txt)
+    if not regs:
+        print(f'info registers EMPTY raw[:160]={regs_txt[:160]!r}', file=sys.stderr)
     fp = regs.get('X29', 0)
     stack = b''
     if fp and fp > 0x40000000:
-        q.call('pmemsave', val=fp, size=4096, filename=f'{out}/stack_{t}.bin')
+        q.hmp(f'pmemsave {fp:#x} 4096 {out}/stack_{t}.bin')
         stack_path = f'{out}/stack_{t}.bin'
         if os.path.exists(stack_path):
             stack = open(stack_path, 'rb').read()
-    q.call('pmemsave', val=FB_BASE, size=FB_STRIDE * FB_H, filename=f'{out}/fbsnap_{t}.raw')
-    fb_path = f'{out}/fbsnap_{t}.raw'
+    q.hmp(f'pmemsave {FB_BASE:#x} {FB_STRIDE * FB_H} {out}/fbsnap.bin')
+    fb_path = f'{out}/fbsnap.bin'
     if os.path.exists(fb_path):
         write_png(f'{out}/fb_t{t}.png', open(fb_path, 'rb').read())
         os.unlink(fb_path)
@@ -105,14 +110,14 @@ def sample(q, out, t, samples):
     entry = {'t': t, 'pc': regs.get('PC', 0), 'x30': regs.get('X30', 0),
              'x29': fp, 'sp': regs.get('SP', 0)}
     chain = []
-    f = fp
-    while stack and 0 <= f - fp < len(stack) - 16:
-        off = f - fp
+    cur = fp
+    while stack and 0 <= cur - fp < len(stack) - 16:
+        off = cur - fp
         next_fp, lr = struct.unpack_from('<2Q', stack, off)
         chain.append(hex(lr))
-        if not next_fp or next_fp <= f:
+        if not next_fp or next_fp <= cur:
             break
-        f = next_fp
+        cur = next_fp
     entry['chain'] = chain
     samples.append(entry)
     print(f'sample t={t}s pc={entry["pc"]:#x} fp={fp:#x} frames={len(chain)}', file=sys.stderr)
@@ -124,7 +129,7 @@ def main():
     ap.add_argument('outdir')
     ap.add_argument('--secs', type=float, default=45)
     ap.add_argument('--cpu', default='cortex-a53')
-    ap.add_argument('--sample', type=float, default=0, help='sample interval seconds (0=off)')
+    ap.add_argument('--sample', type=float, default=0)
     a = ap.parse_args()
 
     payload = open(a.payload, 'rb').read()
@@ -163,11 +168,13 @@ def main():
                 sample(q, out, int(el), samples)
                 fails = 0
             except Exception as e:
-                print(f'sample failed: {e}', file=sys.stderr)
+                print(f'sample failed: {type(e).__name__}: {e}', file=sys.stderr)
                 fails += 1
                 try:
-                    if q: q.close()
-                except Exception: pass
+                    if q:
+                        q.close()
+                except Exception:
+                    pass
                 q = None
                 if fails >= 3:
                     print('sampling disabled after repeated failures', file=sys.stderr)
@@ -176,22 +183,27 @@ def main():
                 next_sample += a.sample
         time.sleep(0.2)
 
+    result = {'status': 'qemu_exited', 'qemu_returncode': p.returncode}
     if p.poll() is None:
-        q = QMP(mon)
-        q.call('stop')
-        regs_txt = q.hmp('info registers')
-        open(f'{out}/regs.txt', 'w').write(regs_txt)
-        r = q.call('pmemsave', val=FB_BASE, size=FB_STRIDE * FB_H, filename=f'{out}/fb.raw')
-        if 'error' in r:
-            print(f"pmemsave: {r['error']}", file=sys.stderr)
-        p.kill()
-        p.wait()
-        raw = open(f'{out}/fb.raw', 'rb').read()
-        write_png(f'{out}/fb.png', raw)
-        os.unlink(f'{out}/fb.raw')
-        result = {'status': 'captured', 'samples': samples}
+        try:
+            if q is None:
+                q = QMP(mon)
+            q.call('stop')
+            regs_txt = q.hmp('info registers')
+            open(f'{out}/regs.txt', 'w').write(regs_txt)
+            q.hmp(f'pmemsave {FB_BASE:#x} {out}/fb.raw {FB_STRIDE * FB_H}')
+            p.kill()
+            p.wait()
+            raw = open(f'{out}/fb.raw', 'rb').read()
+            write_png(f'{out}/fb.png', raw)
+            os.unlink(f'{out}/fb.raw')
+            result = {'status': 'captured', 'samples': len(samples)}
+        except Exception as e:
+            print(f'final capture failed: {e}', file=sys.stderr)
+            p.kill()
+            p.wait()
     else:
-        result = {'status': 'qemu_exited', 'qemu_returncode': p.returncode}
+        print(f'qemu exited early: {p.returncode}', file=sys.stderr)
 
     open(f'{out}/result.json', 'w').write(json.dumps(result, indent=2) + '\n')
     open(f'{out}/samples.json', 'w').write(json.dumps(samples, indent=2) + '\n')
@@ -201,5 +213,4 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
-
 
