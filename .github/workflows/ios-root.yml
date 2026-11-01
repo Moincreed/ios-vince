@@ -24,7 +24,7 @@ jobs:
         run: |
           curl -sL -o ipsw.tar.gz "https://github.com/blacktop/ipsw/releases/download/v3.1.741/ipsw_3.1.741_linux_x86_64.tar.gz"
           tar xzf ipsw.tar.gz
-          ./ipsw --version
+          ./ipsw version
       - name: Download IPSW
         run: |
           curl -sS -L --retry 3 -o ipsw.ipsw "https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw"
