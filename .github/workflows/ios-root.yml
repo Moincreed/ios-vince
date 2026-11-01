@@ -10,7 +10,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y hfsprogs rsync android-sdk-libsparse-utils unzip jq g++ cmake libfuse3-dev libbz2-dev zlib1g-dev dmg2img
+          sudo apt-get install -y hfsprogs rsync android-sdk-libsparse-utils unzip jq g++ cmake libfuse3-dev libbz2-dev zlib1g-dev
       - name: Build apfs-fuse from source
         run: |
           git clone --recursive --depth 1 https://github.com/sgan81/apfs-fuse.git
@@ -19,7 +19,6 @@ jobs:
           cmake .. -DCMAKE_BUILD_TYPE=Release
           make -j2
           sudo cp apfs-fuse /usr/local/bin/
-          apfs-fuse -V || true
       - name: Download ipsw CLI
         run: |
           curl -sL -o ipsw.tar.gz "https://github.com/blacktop/ipsw/releases/download/v3.1.741/ipsw_3.1.741_linux_x86_64.tar.gz"
@@ -35,34 +34,20 @@ jobs:
           unzip -o ipsw.ipsw "*.dmg" -d work/dmgs/ >/dev/null
           unzip -o ipsw.ipsw "*DeviceTree.d22ap.im4p" -d work/dt/ >/dev/null
           ls -laS work/dmgs/
-      - name: Probe dmg formats
-        run: |
-          for f in work/dmgs/*.dmg; do
-            echo "== $f =="
-            echo "head 64B:"; head -c 64 "$f" | xxd | head -3
-            echo "tail 512B koly check:"; tail -c 512 "$f" | xxd | grep -a -c koly || echo "no koly"
-            echo "tail 512B last 32B:"; tail -c 32 "$f" | xxd
-          done
       - name: Extract DeviceTree ADT
         run: |
           DT=$(find work/dt -name "*.im4p" | head -1)
-          ./ipsw img4 im4p extract "$DT" -o d22ap.adt || echo "dt extraction failed (optional)"
-          ls -la d22ap.adt || true
-      - name: Note OS dmg is raw APFS
-        run: echo "OS dmg is raw APFS, adaptive mount handles it"
+          ./ipsw img4 im4p extract "$DT" -o d22ap.adt
+          ls -la d22ap.adt
+      - name: Build iOS root (mkiosroot, adaptive mount)
         run: |
-          sudo apt-get install -y dmg2img
           cd work/dmgs
           OS=$(ls -S *.dmg | head -1)
-          dmg2img -o OS-raw.img "$OS"
-          ls -la OS-raw.img
-      - name: Build iOS root (mkiosroot)
-        run: |
-          sed -i 's|ln -s "$1" "$work/$2.dmg"|ln -s "$1" "$work/$2"|' tools/mkiosroot.sh
-          SYSOS=$(ls -S work/dmgs/*.dmg | head -2 | tail -1)
-          APPOS=$(ls -S work/dmgs/*.dmg | head -3 | tail -1)
-          echo "SYSOS=$SYSOS APPOS=$APPOS"
-          sudo bash tools/mkiosroot.sh work/dmgs/OS-raw.img "$SYSOS" "$APPOS" /mnt/ios16-root.img 16G
+          SYSOS=$(ls -S *.dmg | head -2 | tail -1)
+          APPOS=$(ls -S *.dmg | head -3 | tail -1)
+          echo "OS=$OS SYSOS=$SYSOS APPOS=$APPOS"
+          cd ../..
+          sudo bash tools/mkiosroot.sh "work/dmgs/$OS" "work/dmgs/$SYSOS" "work/dmgs/$APPOS" /mnt/ios16-root.img 16G
       - name: Apply vince tweaks
         run: |
           sudo mkdir -p /mnt/iosroot
