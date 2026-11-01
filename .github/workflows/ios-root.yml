@@ -24,9 +24,13 @@ jobs:
         run: hdiutil attach dmgs/087-86593-047.dmg -mountpoint /Volumes/sysos -nobrowse -readonly
       - name: Mount AppOS (optional)
         run: hdiutil attach dmgs/087-86622-047.dmg -mountpoint /Volumes/appos -nobrowse -readonly || echo "AppOS skipped"
-      - name: Create 8G HFS+ image and mount
+      - name: Free disk (delete DMGs, mounts persist via open fds)
         run: |
-          hdiutil create -size 8g -fs "Case-sensitive HFS+" -volname iOSRoot ios16-root.dmg
+          rm -rf dmgs
+          df -h /
+      - name: Create 12G HFS+ image and mount
+        run: |
+          hdiutil create -size 12g -fs "Case-sensitive HFS+" -volname iOSRoot ios16-root.dmg
           hdiutil attach ios16-root.dmg -mountpoint /Volumes/iOSRoot -nobrowse
       - name: Copy OS root
         run: sudo rsync -aH --numeric-ids /Volumes/os/ /Volumes/iOSRoot/
