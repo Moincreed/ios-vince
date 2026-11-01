@@ -10,7 +10,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y hfsprogs rsync android-sdk-libsparse-utils unzip jq g++ cmake libfuse3-dev libbz2-dev zlib1g-dev
+          sudo apt-get install -y hfsprogs rsync android-sdk-libsparse-utils jq g++ cmake libfuse3-dev libbz2-dev zlib1g-dev 7zip
       - name: Build apfs-fuse from source
         run: |
           git clone --recursive --depth 1 https://github.com/sgan81/apfs-fuse.git
@@ -31,9 +31,11 @@ jobs:
       - name: Extract DMGs and DeviceTree
         run: |
           mkdir -p work/dmgs
-          unzip -o ipsw.ipsw "*.dmg" -d work/dmgs/ >/dev/null
-          unzip -o ipsw.ipsw "*DeviceTree.d22ap.im4p" -d work/dt/ >/dev/null
+          7zz x -owork/dmgs ipsw.ipsw "*.dmg" -bso0 -bsp0
+          7zz x -owork/dt ipsw.ipsw "*DeviceTree.d22ap.im4p" -bso0 -bsp0
           ls -laS work/dmgs/
+          echo "=== OS dmg tail verification (expect koly) ==="
+          tail -c 512 work/dmgs/087-86698-044.dmg | od -c | head -2
       - name: Extract DeviceTree ADT
         run: |
           DT=$(find work/dt -name "*.im4p" | head -1)
