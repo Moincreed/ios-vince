@@ -45,6 +45,11 @@ jobs:
           DT=$(find work/dt -name "*.im4p" | head -1)
           ./ipsw img4 im4p extract "$DT" -o d22ap.adt || echo "DT optional"
           ls -la d22ap.adt || true
+      - name: apfs-fuse verbose debug
+        run: |
+          sudo mkdir -p /mnt/test
+          sudo apfs-fuse work/dmgs/087-86698-044.dmg /mnt/test -o dbg_level=15 2>&1 | head -60 || true
+          sudo umount /mnt/test 2>/dev/null || true
       - name: Build iOS root (mkiosroot, adaptive mount)
         run: |
           cd work/dmgs
