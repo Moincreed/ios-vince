@@ -35,6 +35,14 @@ jobs:
           unzip -o ipsw.ipsw "*.dmg" -d work/dmgs/ >/dev/null
           unzip -o ipsw.ipsw "*DeviceTree.d22ap.im4p" -d work/dt/ >/dev/null
           ls -laS work/dmgs/
+      - name: Probe dmg formats
+        run: |
+          for f in work/dmgs/*.dmg; do
+            echo "== $f =="
+            echo "head 64B:"; head -c 64 "$f" | xxd | head -3
+            echo "tail 512B koly check:"; tail -c 512 "$f" | xxd | grep -a -c koly || echo "no koly"
+            echo "tail 512B last 32B:"; tail -c 32 "$f" | xxd
+          done
       - name: Extract DeviceTree ADT
         run: |
           DT=$(find work/dt -name "*.im4p" | head -1)
