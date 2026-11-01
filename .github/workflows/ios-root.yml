@@ -59,9 +59,13 @@ jobs:
           hdiutil detach /Volumes/sysos -force || true
           hdiutil detach /Volumes/appos -force || true
           hdiutil detach /Volumes/iOSRoot -force || true
-      - name: Gzip and publish
+      - name: Gzip, split and publish
         run: |
           gzip -1 ios16-root.dmg
-          gh release upload qemu-demo ios16-root.dmg.gz --clobber -R zjh3215588/ios-vince
+          split -b 1500m ios16-root.dmg.gz ios16-root.part.
+          ls -la ios16-root.part.*
+          for f in ios16-root.part.*; do
+            gh release upload qemu-demo "$f" --clobber -R zjh3215588/ios-vince
+          done
         env:
           GH_TOKEN: ${{ github.token }}
