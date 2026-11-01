@@ -5,70 +5,92 @@ permissions:
   contents: write
 jobs:
   build:
-    runs-on: macos-14
-    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
-      - name: Free disk space
+      - uses: actions/checkout@v4
+
+      - name: Install tools
         run: |
-          sudo rm -rf /Applications/Xcode*.app 2>/dev/null || true
-          df -h /
+          sudo apt-get update
+          sudo apt-get install -y hfsprogs rsync libarchive-tools g++ cmake libfuse3-dev libbz2-dev zlib1g-dev
+          # mkfs.hfsplus / fsck.hfsplus live in /sbin; tools/mkiosroot.sh calls
+          # them without sudo, so make them visible on the normal PATH
+          sudo ln -sf /sbin/mkfs.hfsplus /usr/local/bin/mkfs.hfsplus
+          sudo ln -sf /sbin/fsck.hfsplus /usr/local/bin/fsck.hfsplus
+          mkfs.hfsplus 2>&1 | head -1 || true
+
+      - name: Build apfs-fuse from source
+        run: |
+          git clone --recursive --depth 1 https://github.com/sgan81/apfs-fuse.git
+          cd apfs-fuse
+          mkdir b && cd b
+          cmake .. -DCMAKE_BUILD_TYPE=Release
+          make -j4
+          sudo cp apfs-fuse /usr/local/bin/
+          apfs-fuse 2>&1 | head -2 || true
+
       - name: Download IPSW
         run: |
           curl -sS -L --retry 3 -o ipsw.ipsw "https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw"
           ls -la ipsw.ipsw
-      - name: Extract DMGs
+
+      - name: Extract DMGs (bsdtar; unzip 6.0 corrupts zip64 members)
         run: |
-          mkdir dmgs
-          unzip -o ipsw.ipsw "087-*.dmg" -d dmgs/ >/dev/null
+          mkdir -p work/dmgs
+          bsdtar -xf ipsw.ipsw -C work/dmgs --include="*.dmg"
           rm -f ipsw.ipsw
-          ls -la dmgs/
+          ls -laS work/dmgs/
           df -h /
-      - name: Mount OS volume
-        run: hdiutil attach dmgs/087-86698-044.dmg -mountpoint /Volumes/os -nobrowse -readonly
-      - name: Mount SystemOS
-        run: hdiutil attach dmgs/087-86593-047.dmg -mountpoint /Volumes/sysos -nobrowse -readonly
-      - name: Mount AppOS (optional)
-        run: hdiutil attach dmgs/087-86622-047.dmg -mountpoint /Volumes/appos -nobrowse -readonly || echo "AppOS skipped"
-      - name: Create 10G HFS+ image and mount
+
+      - name: Build iOS root (canonical tools/mkiosroot.sh)
         run: |
-          hdiutil create -size 10g -fs "Case-sensitive HFS+" -volname iOSRoot ios16-root.dmg
-          hdiutil attach ios16-root.dmg -mountpoint /Volumes/iOSRoot -nobrowse
-      - name: Copy OS root
-        run: sudo rsync -aH --numeric-ids /Volumes/os/ /Volumes/iOSRoot/
-      - name: Copy cryptexes
+          export PATH="/usr/local/bin:/usr/sbin:/sbin:$PATH"
+          set -x
+          OS=$(ls work/dmgs/087-86698-*.dmg | head -1)
+          SYSOS=$(ls work/dmgs/087-86593-*.dmg | head -1)
+          APPOS=$(ls work/dmgs/087-86622-*.dmg | head -1)
+          # 10G fits any vince userdata (even the 32 GB model ~23.5G); root
+          # content is ~4.5G, so 5.5G stays free on the phone
+          bash tools/mkiosroot.sh "$OS" "$SYSOS" "$APPOS" ios16-root.img 10G
+          ls -la ios16-root.img
+          df -h /
+
+      - name: Free intermediate space
         run: |
-          sudo mkdir -p /Volumes/iOSRoot/private/preboot/Cryptexes/OS
-          sudo rsync -aH --numeric-ids /Volumes/sysos/ /Volumes/iOSRoot/private/preboot/Cryptexes/OS/
-          if [ -d /Volumes/appos ]; then
-            sudo mkdir -p /Volumes/iOSRoot/private/preboot/Cryptexes/App
-            sudo rsync -aH --numeric-ids /Volumes/appos/ /Volumes/iOSRoot/private/preboot/Cryptexes/App/
-          fi
-      - name: dyld cache links
+          rm -rf work/dmgs apfs-fuse
+          df -h /
+
+      - name: Compress
         run: |
-          sudo mkdir -p /Volumes/iOSRoot/System/Library/Caches/com.apple.dyld
-          for f in /Volumes/iOSRoot/private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld/*; do
-            sudo ln "$f" /Volumes/iOSRoot/System/Library/Caches/com.apple.dyld/$(basename $f) 2>/dev/null || true
-          done
-      - name: Keybag
+          gzip -1 ios16-root.img
+          ls -la ios16-root.img.gz
+          df -h /
+
+      - name: Split for release (2 GiB per-asset limit)
         run: |
-          sudo mkdir -p /Volumes/iOSRoot/private/var/keybags
-          sudo install -m 0600 -o 0 -g 0 /dev/null /Volumes/iOSRoot/private/var/keybags/systembag.kb
-          printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>KeyBagKeys</key><data>U1dGUlVRQQ==</data></dict></plist>' | sudo tee /Volumes/iOSRoot/private/var/keybags/systembag.kb >/dev/null
-      - name: Detach
+          split -b 1900M -d --additional-suffix=.part ios16-root.img.gz ios16-root.img.gz-
+          ls -la ios16-root.img.gz-*.part
+          sha256sum ios16-root.img.gz ios16-root.img.gz-*.part > SHA256SUMS
+          cat SHA256SUMS
+          {
+            echo '### Local reassembly'
+            echo '- Windows: `copy /b ios16-root.img.gz-00.part+ios16-root.img.gz-01.part+ios16-root.img.gz-02.part ios16-root.img.gz`'
+            echo '- Linux/macOS: `cat ios16-root.img.gz-*.part > ios16-root.img.gz`'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish to release
         run: |
-          hdiutil detach /Volumes/os -force || true
-          hdiutil detach /Volumes/sysos -force || true
-          hdiutil detach /Volumes/appos -force || true
-          hdiutil detach /Volumes/iOSRoot -force || true
-      - name: Gzip and publish
-        run: |
-          gzip -1 ios16-root.dmg
-          ls -la ios16-root.dmg.gz
-          gh release upload qemu-demo ios16-root.dmg.gz d22ap.adt --clobber -R zjh3215588/ios-vince
+          gh release upload qemu-demo ios16-root.img.gz-*.part SHA256SUMS --clobber -R zjh3215588/ios-vince
+          gh release view qemu-demo -R zjh3215588/ios-vince --json assets --jq '.assets[].name'
         env:
           GH_TOKEN: ${{ github.token }}
+
       - name: Upload artifact copy
         uses: actions/upload-artifact@v4
         with:
-          name: ios16-root
-          path: ios16-root.dmg.gz
+          name: ios16-root-parts
+          path: |
+            ios16-root.img.gz-*.part
+            SHA256SUMS
+          retention-days: 7
