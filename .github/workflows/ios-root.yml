@@ -31,8 +31,8 @@ jobs:
       - name: Extract DMGs and DeviceTree
         run: |
           mkdir -p work/dmgs
-          7zz x -owork/dmgs ipsw.ipsw "*.dmg" -bso0 -bsp0
-          7zz x -owork/dt ipsw.ipsw "*DeviceTree.d22ap.im4p" -bso0 -bsp0
+          7z x -owork/dmgs ipsw.ipsw "*.dmg" -bso0 -bsp0
+          7z x -owork/dt ipsw.ipsw "*DeviceTree.d22ap.im4p" -bso0 -bsp0
           ls -laS work/dmgs/
           echo "=== OS dmg tail verification (expect koly) ==="
           tail -c 512 work/dmgs/087-86698-044.dmg | od -c | head -2
