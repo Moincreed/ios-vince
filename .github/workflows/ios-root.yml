@@ -3,98 +3,96 @@ on:
   workflow_dispatch:
 jobs:
   build:
-    runs-on: macos-13
-    timeout-minutes: 110
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y hfsprogs rsync libarchive-tools jq g++ cmake libfuse3-dev libbz2-dev zlib1g-dev
+      - name: Build apfs-fuse from source
+        run: |
+          git clone --recursive --depth 1 https://github.com/sgan81/apfs-fuse.git
+          cd apfs-fuse
+          mkdir b && cd b
+          cmake .. -DCMAKE_BUILD_TYPE=Release
+          make -j2
+          sudo cp apfs-fuse /usr/local/bin/
+      - name: Download ipsw CLI
+        run: |
+          curl -sL -o ipsw.tar.gz "https://github.com/blacktop/ipsw/releases/download/v3.1.741/ipsw_3.1.741_linux_x86_64.tar.gz"
+          tar xzf ipsw.tar.gz
+          ./ipsw version
       - name: Download IPSW
         run: |
           curl -sS -L --retry 3 -o ipsw.ipsw "https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw"
           ls -la ipsw.ipsw
-      - name: Extract DMGs
+      - name: Extract DMGs and DeviceTree
         run: |
-          mkdir -p dmgs
-          unzip -o ipsw.ipsw "087-*.dmg" -d dmgs/ >/dev/null
+          mkdir -p work/dmgs
+          bsdtar -xf ipsw.ipsw -C work/dmgs --include="*.dmg"
+          bsdtar -xf ipsw.ipsw -C work/dt --include="*DeviceTree.d22ap.im4p"
           rm -f ipsw.ipsw
-          ls -la dmgs/
-          df -h /
-      - name: Free disk space (remove Xcode)
+          ls -laS work/dmgs/
+      - name: Mount OS volume (apfs-fuse)
         run: |
-          sudo rm -rf /Applications/Xcode*.app || true
-          df -h /
-          df -h /System/Volumes/Data
-      - name: Mount OS volume
+          sudo mkdir -p /mnt/os /mnt/sysos /mnt/appos
+          sudo apfs-fuse work/dmgs/087-86698-044.dmg /mnt/os
+          ls /mnt/os/ || true
+      - name: Mount SystemOS
         run: |
-          hdiutil attach dmgs/087-86698-044.dmg -mountpoint /Volumes/os -nobrowse -readonly
-          ls /Volumes/os/
-      - name: Mount SystemOS cryptex
+          sudo apfs-fuse work/dmgs/087-86593-047.dmg /mnt/sysos
+          ls /mnt/sysos/ || true
+      - name: Mount AppOS
         run: |
-          hdiutil attach dmgs/087-86593-047.dmg -mountpoint /Volumes/sysos -nobrowse -readonly
-          ls /Volumes/sysos/ || true
-          rm -f dmgs/087-86593-047.dmg
-      - name: Mount AppOS cryptex
+          sudo apfs-fuse work/dmgs/087-86622-047.dmg /mnt/appos || echo "AppOS optional"
+          ls /mnt/appos/ || true
+      - name: Create 10G HFS+ root image
         run: |
-          hdiutil attach dmgs/087-86622-047.dmg -mountpoint /Volumes/appos -nobrowse -readonly || echo "AppOS optional for A11"
-          ls /Volumes/appos/ || true
-          rm -f dmgs/087-86622-047.dmg
-      - name: Create 12G HFS+ root image
+          mkfs.hfsplus -s -J -v iOSRoot work/ios16-root.img
+          ls -la work/ios16-root.img
+      - name: Mount HFS+ image
         run: |
-          hdiutil create -size 12g -fs "Case-sensitive HFS+" -volname iOSRoot ios16-root.dmg
-          hdiutil attach ios16-root.dmg -mountpoint /Volumes/iOSRoot -nobrowse
-          ls /Volumes/iOSRoot/
-          df -h /
+          sudo mkdir -p /mnt/iosroot
+          sudo mount -t hfsplus -o loop,force work/ios16-root.img /mnt/iosroot
       - name: Copy OS root
         run: |
-          rm -f dmgs/087-86698-044.dmg
-          df -h /
-          sudo rsync -aH --numeric-ids /Volumes/os/ /Volumes/iOSRoot/
-          df -h /
-          df -h /
-          df -h /
+          sudo rsync -aH --numeric-ids /mnt/os/ /mnt/iosroot/
       - name: Copy cryptexes
         run: |
-          sudo mkdir -p /Volumes/iOSRoot/private/preboot/Cryptexes/OS
-          sudo mkdir -p /Volumes/iOSRoot/private/preboot/Cryptexes/App
-          sudo rsync -aH --numeric-ids /Volumes/sysos/ /Volumes/iOSRoot/private/preboot/Cryptexes/OS/
-          if [ -d /Volumes/appos ]; then sudo rsync -aH --numeric-ids /Volumes/appos/ /Volumes/iOSRoot/private/preboot/Cryptexes/App/; else echo "AppOS skipped"; fi
+          sudo mkdir -p /mnt/iosroot/private/preboot/Cryptexes/OS
+          sudo mkdir -p /mnt/iosroot/private/preboot/Cryptexes/App
+          sudo rsync -aH --numeric-ids /mnt/sysos/ /mnt/iosroot/private/preboot/Cryptexes/OS/
+          if [ -d /mnt/appos ] && [ -n "$(ls /mnt/appos/ 2>/dev/null)" ]; then
+            sudo rsync -aH --numeric-ids /mnt/appos/ /mnt/iosroot/private/preboot/Cryptexes/App/
+          else
+            echo "AppOS skipped"
+          fi
       - name: dyld cache hard links
         run: |
-          sudo mkdir -p /Volumes/iOSRoot/System/Library/Caches/com.apple.dyld
-          for f in /Volumes/iOSRoot/private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld/*; do
-            sudo ln "$f" /Volumes/iOSRoot/System/Library/Caches/com.apple.dyld/$(basename $f) 2>/dev/null || true
-          done
-      - name: Cryptex hard links
-        run: |
-          for c in OS App; do
-            cd /Volumes/iOSRoot/private/preboot/Cryptexes/$c
-            sudo find . ! -type d ! -path './System/Library/Caches/com.apple.dyld/*' | while IFS= read -r f; do
-              f=${f#./}
-              if [ ! -e /Volumes/iOSRoot/$f ] && [ ! -L /Volumes/iOSRoot/$f ]; then
-                sudo mkdir -p /Volumes/iOSRoot/$(dirname $f)
-                src=/Volumes/iOSRoot/private/preboot/Cryptexes/$c/$f
-                if [ -L "$src" ]; then sudo cp -P "$src" /Volumes/iOSRoot/$f; else sudo ln "$src" /Volumes/iOSRoot/$f; fi
-              fi
-            done
+          sudo mkdir -p /mnt/iosroot/System/Library/Caches/com.apple.dyld
+          for f in /mnt/iosroot/private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld/*; do
+            sudo ln "$f" /mnt/iosroot/System/Library/Caches/com.apple.dyld/$(basename $f) 2>/dev/null || true
           done
       - name: System keybag
         run: |
-          sudo mkdir -p /Volumes/iOSRoot/private/var/keybags
-          sudo install -m 0600 -o 0 -g 0 /dev/null /Volumes/iOSRoot/private/var/keybags/systembag.kb
-          printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>KeyBagKeys</key><data>U1dGUlVRQQ==</data></dict></plist>' | sudo tee /Volumes/iOSRoot/private/var/keybags/systembag.kb >/dev/null
-      - name: Detach all
+          sudo mkdir -p /mnt/iosroot/private/var/keybags
+          sudo install -m 0600 -o 0 -g 0 /dev/null /mnt/iosroot/private/var/keybags/systembag.kb
+          printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>KeyBagKeys</key><data>U1dGUlVRQQ==</data></dict></plist>' | sudo tee /mnt/iosroot/private/var/keybags/systembag.kb >/dev/null
+      - name: Unmount everything
         run: |
-          hdiutil detach /Volumes/os -force || true
-          hdiutil detach /Volumes/sysos -force || true
-          hdiutil detach /Volumes/appos -force || true
-          hdiutil detach /Volumes/iOSRoot -force || true
-          rm -rf dmgs
-          df -h /
+          sudo umount /mnt/iosroot || sudo umount -f /mnt/iosroot || true
+          sudo umount /mnt/os 2>/dev/null || sudo umount -f /mnt/os 2>/dev/null || true
+          sudo umount /mnt/sysos 2>/dev/null || true
+          sudo umount /mnt/appos 2>/dev/null || true
+          sync
       - name: Compress
         run: |
-          gzip -1 ios16-root.dmg
-          ls -la ios16-root.dmg.gz
+          gzip -1 work/ios16-root.img
+          ls -la work/ios16-root.img.gz
       - name: Publish to release
         run: |
-          gh release upload qemu-demo ios16-root.dmg.gz d22ap.adt --clobber -R zjh3215588/ios-vince
+          gh release upload qemu-demo work/ios16-root.img.gz --clobber -R zjh3215588/ios-vince
         env:
           GH_TOKEN: ${{ github.token }}
