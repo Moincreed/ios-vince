@@ -64,7 +64,7 @@ apfs_mount() {
 	local src
 	mkdir "$work/$2"
 	local src
-	if tail -c 512 "$1" | grep -aq koly; then
+	if tail -c 512 "$1" | head -c 4 | grep -aq koly; then
 		src="$work/$2.dmg"
 	else
 		src="$work/$2.link"
