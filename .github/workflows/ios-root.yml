@@ -49,6 +49,10 @@ jobs:
         run: |
           sudo apfs-fuse work/dmgs/087-86622-047.dmg /mnt/appos || echo "AppOS optional"
           ls /mnt/appos/ || true
+      - name: Free disk space (delete DMGs, FUSE keeps open fds)
+        run: |
+          rm -rf work/dmgs
+          df -h /
       - name: Create 10G HFS+ root image
         run: |
           mkfs.hfsplus -s -J -v iOSRoot ios16-root.img
