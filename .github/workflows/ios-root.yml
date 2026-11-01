@@ -22,7 +22,7 @@ jobs:
           apfs-fuse -V || true
       - name: Download ipsw CLI
         run: |
-          curl -sL -o ipsw.tar.gz "https://github.com/blacktop/ipsw/releases/download/v3.1.741/ipsw_3.1.741_linux_amd64.tar.gz"
+          curl -sL -o ipsw.tar.gz "https://github.com/blacktop/ipsw/releases/download/v3.1.741/ipsw_3.1.741_linux_x86_64.tar.gz"
           tar xzf ipsw.tar.gz
           ./ipsw --version
       - name: Download IPSW
