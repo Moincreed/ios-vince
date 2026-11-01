@@ -10,7 +10,14 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y hfsprogs apfs-fuse rsync android-sdk-libsparse-utils unzip jq
+          sudo apt-get install -y hfsprogs rsync android-sdk-libsparse-utils unzip jq g++ cmake libfuse3-dev
+      - name: Build apfs-fuse from source
+        run: |
+          git clone --recursive --depth 1 https://github.com/apfs-fuse/apfs-fuse.git
+          cd apfs-fuse
+          ./build.sh
+          sudo cp build/apfs-fuse /usr/local/bin/
+          apfs-fuse -V || true
       - name: Download ipsw CLI
         run: |
           ASSET_URL=$(curl -sL https://api.github.com/repos/blacktop/ipsw/releases/latest | jq -r '.assets[] | select(.name | test("linux_x86_64.tar.gz$")) | .browser_download_url' | head -1)
