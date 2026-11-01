@@ -89,23 +89,12 @@ jobs:
           hdiutil detach /Volumes/iOSRoot -force || true
           rm -rf dmgs
           df -h /
-      - name: Convert to raw
-        run: |
-          hdiutil convert ios16-root.dmg -format UDRW -o ios16-root.raw
-          mv ios16-root.raw.dmg ios16-root.raw
-          rm -f ios16-root.dmg
-          ls -la ios16-root.raw
-          df -h /
-          hdiutil convert ios16-root.dmg -format UDRW -o ios16-root.raw
-          rm -f ios16-root.dmg
-          ls -la ios16-root.raw
-          df -h /
       - name: Compress
         run: |
-          gzip -1 ios16-root.raw
-          ls -la ios16-root.raw.gz
+          gzip -1 ios16-root.dmg
+          ls -la ios16-root.dmg.gz
       - name: Publish to release
         run: |
-          gh release upload qemu-demo ios16-root.raw.gz d22ap.adt --clobber -R zjh3215588/ios-vince
+          gh release upload qemu-demo ios16-root.dmg.gz d22ap.adt --clobber -R zjh3215588/ios-vince
         env:
           GH_TOKEN: ${{ github.token }}
