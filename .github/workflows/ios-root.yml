@@ -1,6 +1,9 @@
 name: ios-root
 on:
   workflow_dispatch:
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -35,7 +38,7 @@ jobs:
           7z x -owork/dt ipsw.ipsw "*DeviceTree.d22ap.im4p" -bso0 -bsp0
           ls -laS work/dmgs/
           echo "=== OS dmg tail verification (expect koly) ==="
-          tail -c 512 work/dmgs/087-86698-044.dmg | od -c | head -2
+          tail -c 512 work/dmgs/087-86698-044.dmg | od -c | head -2 || true
       - name: Extract DeviceTree ADT
         run: |
           DT=$(find work/dt -name "*.im4p" | head -1)
@@ -63,7 +66,12 @@ jobs:
           rm -f /mnt/ios16-root.img
           ls -la ios16-root.simg
           df -h /mnt
-      - name: Upload root image
+      - name: Publish to release
+        run: |
+          gh release upload qemu-demo ios16-root.simg d22ap.adt --clobber -R zjh3215588/ios-vince
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Upload artifact copy
         uses: actions/upload-artifact@v4
         with:
           name: ios16-root
