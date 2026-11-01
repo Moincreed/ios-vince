@@ -13,10 +13,12 @@ jobs:
           sudo apt-get install -y hfsprogs rsync android-sdk-libsparse-utils unzip jq g++ cmake libfuse3-dev
       - name: Build apfs-fuse from source
         run: |
-          git clone --recursive --depth 1 https://github.com/sgan81/apfs-fuse.git
+          git clone --depth 1 https://github.com/sgan81/apfs-fuse.git
           cd apfs-fuse
-          ./build.sh
-          sudo cp build/apfs-fuse /usr/local/bin/
+          mkdir b && cd b
+          cmake .. -DCMAKE_BUILD_TYPE=Release
+          make -j2
+          sudo cp apfs-fuse /usr/local/bin/
           apfs-fuse -V || true
       - name: Download ipsw CLI
         run: |
