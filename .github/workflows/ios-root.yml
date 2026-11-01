@@ -34,7 +34,8 @@ jobs:
           rm -f dmgs/087-86622-047.dmg
       - name: Create 12G HFS+ root image
         run: |
-          hdiutil create -size 12g -fs "Case-sensitive HFS+" -volname iOSRoot -attach ios16-root ios16-root.dmg
+          hdiutil create -size 12g -fs "Case-sensitive HFS+" -volname iOSRoot ios16-root.dmg
+          hdiutil attach ios16-root.dmg -mountpoint /Volumes/iOSRoot -nobrowse
           ls /Volumes/iOSRoot/
           df -h /
       - name: Copy OS root
