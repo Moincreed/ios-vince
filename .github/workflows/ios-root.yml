@@ -30,7 +30,7 @@ jobs:
           ls /Volumes/appos/ || true
       - name: Create 16G HFS+ root image
         run: |
-          hdiutil create -size 16g -fs "Case-sensitive HFS+" -volname iOSRoot -attach ios16-root -nobrowse
+          hdiutil create -size 16g -fs "Case-sensitive HFS+" -volname iOSRoot -attach ios16-root
           ls /Volumes/iOSRoot/
       - name: Copy OS root
         run: |
