@@ -8,39 +8,75 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 60
     steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /Applications/Xcode*.app 2>/dev/null || true
+          df -h /
       - name: Download IPSW
         run: |
           curl -sS -L --retry 3 -o ipsw.ipsw "https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw"
           ls -la ipsw.ipsw
-      - name: Extract DMGs
+      - name: Extract OS dmg only
         run: |
-          mkdir dmgs
-          unzip -o ipsw.ipsw "087-*.dmg" -d dmgs/ >/dev/null
-          rm -f ipsw.ipsw
+          mkdir -p dmgs
+          python3 -c "
+          import zipfile, os
+          z = zipfile.ZipFile('ipsw.ipsw')
+          for n in z.namelist():
+              if n.endswith('.dmg') and '86698' in n:
+                  z.extract(n, 'dmgs/')
+                  print('extracted:', n)
+          "
           ls -la dmgs/
       - name: Mount OS volume
         run: hdiutil attach dmgs/087-86698-044.dmg -mountpoint /Volumes/os -nobrowse -readonly
-      - name: Mount SystemOS
-        run: hdiutil attach dmgs/087-86593-047.dmg -mountpoint /Volumes/sysos -nobrowse -readonly
-      - name: Mount AppOS (optional)
-        run: hdiutil attach dmgs/087-86622-047.dmg -mountpoint /Volumes/appos -nobrowse -readonly || echo "AppOS skipped"
-      - name: Free disk (delete DMGs, mounts persist via open fds)
-        run: |
-          rm -rf dmgs
-          df -h /
-      - name: Create 12G HFS+ image and mount
+      - name: Create 12G HFS+ image
         run: |
           hdiutil create -size 12g -fs "Case-sensitive HFS+" -volname iOSRoot ios16-root.dmg
+      - name: Mount HFS+ image
+        run: |
           hdiutil attach ios16-root.dmg -mountpoint /Volumes/iOSRoot -nobrowse
       - name: Copy OS root
-        run: sudo rsync -aH --numeric-ids /Volumes/os/ /Volumes/iOSRoot/
-      - name: Copy cryptexes
+        run: |
+          sudo rsync -aH --numeric-ids /Volumes/os/ /Volumes/iOSRoot/
+          df -h /
+      - name: Detach OS volume
+        run: hdiutil detach /Volumes/os -force || true
+      - name: Extract and mount SystemOS
+        run: |
+          python3 -c "
+          import zipfile
+          z = zipfile.ZipFile('ipsw.ipsw')
+          for n in z.namelist():
+              if n.endswith('.dmg') and '86593' in n:
+                  z.extract(n, 'dmgs/')
+                  print('extracted:', n)
+          "
+          hdiutil attach dmgs/087-86593-047.dmg -mountpoint /Volumes/sysos -nobrowse -readonly
+      - name: Copy SystemOS cryptex
         run: |
           sudo mkdir -p /Volumes/iOSRoot/private/preboot/Cryptexes/OS
           sudo rsync -aH --numeric-ids /Volumes/sysos/ /Volumes/iOSRoot/private/preboot/Cryptexes/OS/
+          hdiutil detach /Volumes/sysos -force || true
+      - name: Extract and mount AppOS
+        run: |
+          python3 -c "
+          import zipfile
+          z = zipfile.ZipFile('ipsw.ipsw')
+          for n in z.namelist():
+              if n.endswith('.dmg') and '86622' in n:
+                  z.extract(n, 'dmgs/')
+                  print('extracted:', n)
+          " || true
+          hdiutil attach dmgs/087-86622-047.dmg -mountpoint /Volumes/appos -nobrowse -readonly 2>/dev/null || echo "AppOS skipped"
+      - name: Copy AppOS cryptex
+        run: |
           if [ -d /Volumes/appos ]; then
             sudo mkdir -p /Volumes/iOSRoot/private/preboot/Cryptexes/App
             sudo rsync -aH --numeric-ids /Volumes/appos/ /Volumes/iOSRoot/private/preboot/Cryptexes/App/
+            hdiutil detach /Volumes/appos -force || true
+          else
+            echo "AppOS skipped"
           fi
       - name: dyld cache links
         run: |
@@ -53,19 +89,14 @@ jobs:
           sudo mkdir -p /Volumes/iOSRoot/private/var/keybags
           sudo install -m 0600 -o 0 -g 0 /dev/null /Volumes/iOSRoot/private/var/keybags/systembag.kb
           printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>KeyBagKeys</key><data>U1dGUlVRQQ==</data></dict></plist>' | sudo tee /Volumes/iOSRoot/private/var/keybags/systembag.kb >/dev/null
-      - name: Detach
-        run: |
-          hdiutil detach /Volumes/os -force || true
-          hdiutil detach /Volumes/sysos -force || true
-          hdiutil detach /Volumes/appos -force || true
-          hdiutil detach /Volumes/iOSRoot -force || true
-      - name: Gzip, split and publish
+      - name: Detach HFS+ image
+        run: hdiutil detach /Volumes/iOSRoot -force || true
+      - name: Gzip
         run: |
           gzip -1 ios16-root.dmg
-          split -b 1500m ios16-root.dmg.gz ios16-root.part.
-          ls -la ios16-root.part.*
-          for f in ios16-root.part.*; do
-            gh release upload qemu-demo "$f" --clobber -R zjh3215588/ios-vince
-          done
+          ls -la ios16-root.dmg.gz
+      - name: Publish to release
+        run: |
+          gh release upload qemu-demo ios16-root.dmg.gz --clobber -R zjh3215588/ios-vince
         env:
           GH_TOKEN: ${{ github.token }}
