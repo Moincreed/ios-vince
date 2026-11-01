@@ -43,6 +43,52 @@ jobs:
           ls -laS work/dmgs/
           df -h /
 
+      - name: Normalize images (AppOS ships IM4P-wrapped, apfs-fuse cannot read it)
+        run: |
+          python3 - <<'EOF'
+          import struct, os, glob
+
+          def find_container(path):
+              with open(path, 'rb') as f:
+                  f.seek(0, 2); size = f.tell()
+                  f.seek(max(0, size - 512)); tail = f.read(512)
+                  f.seek(0); head = f.read(1 << 20)
+              if tail[:4] == b'koly':
+                  print(path, ': UDIF (koly trailer) -> keep as-is')
+                  return None
+              start = 0
+              while True:
+                  j = head.find(b'NXSB', start)
+                  if j < 0:
+                      break
+                  x = j - 32
+                  if x >= 0:
+                      oid = struct.unpack('<Q', head[x+8:x+16])[0]
+                      bs  = struct.unpack('<I', head[x+36:x+40])[0]
+                      bc  = struct.unpack('<Q', head[x+40:x+48])[0]
+                      if oid == 1 and bs == 4096 and bc * bs == size - x:
+                          return x
+                  start = j + 1
+              return None
+
+          for path in sorted(glob.glob('work/dmgs/*.dmg')):
+              x = find_container(path)
+              if x is None:
+                  continue
+              if x == 0:
+                  print(path, ': raw APFS at offset 0 -> no slice needed')
+                  continue
+              with open(path, 'rb') as f, open(path + '.apfs', 'wb') as out:
+                  f.seek(x)
+                  while True:
+                      chunk = f.read(1 << 24)
+                      if not chunk:
+                          break
+                      out.write(chunk)
+              os.replace(path + '.apfs', path)
+              print(path, ': stripped', x, '-byte IM4P wrapper, APFS container now at offset 0')
+          EOF
+
       - name: Build iOS root (canonical tools/mkiosroot.sh)
         run: |
           export PATH="/usr/local/bin:/usr/sbin:/sbin:$PATH"
