@@ -42,8 +42,8 @@ jobs:
       - name: Extract DeviceTree ADT
         run: |
           DT=$(find work/dt -name "*.im4p" | head -1)
-          ./ipsw img4 im4p extract "$DT" -o d22ap.adt
-          ls -la d22ap.adt
+          ./ipsw img4 im4p extract "$DT" -o d22ap.adt || echo "DT optional"
+          ls -la d22ap.adt || true
       - name: Build iOS root (mkiosroot, adaptive mount)
         run: |
           cd work/dmgs
