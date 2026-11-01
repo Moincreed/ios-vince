@@ -32,9 +32,9 @@ jobs:
           hdiutil attach dmgs/087-86622-047.dmg -mountpoint /Volumes/appos -nobrowse -readonly || echo "AppOS optional for A11"
           ls /Volumes/appos/ || true
           rm -f dmgs/087-86622-047.dmg
-      - name: Create 8G HFS+ root image
+      - name: Create 12G HFS+ root image
         run: |
-          hdiutil create -size 6g -fs "Case-sensitive HFS+" -volname iOSRoot -attach ios16-root
+          hdiutil create -size 12g -fs "Case-sensitive HFS+" -volname iOSRoot -attach ios16-root
           ls /Volumes/iOSRoot/
           df -h /
       - name: Copy OS root
@@ -42,6 +42,7 @@ jobs:
           rm -f dmgs/087-86698-044.dmg
           df -h /
           sudo rsync -aH --numeric-ids /Volumes/os/ /Volumes/iOSRoot/
+          df -h /
           df -h /
           df -h /
       - name: Copy cryptexes
