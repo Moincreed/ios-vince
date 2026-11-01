@@ -96,9 +96,10 @@ jobs:
           OS=$(ls work/dmgs/087-86698-*.dmg | head -1)
           SYSOS=$(ls work/dmgs/087-86593-*.dmg | head -1)
           APPOS=$(ls work/dmgs/087-86622-*.dmg | head -1)
-          # 10G fits any vince userdata (even the 32 GB model ~23.5G); root
-          # content is ~4.5G, so 5.5G stays free on the phone
-          bash tools/mkiosroot.sh "$OS" "$SYSOS" "$APPOS" ios16-root.img 10G
+          # Canonical default 16G: IPSW content is LZBITMAP-compressed and
+          # expands to ~12-13G (OS root ~9G + cryptexes ~3G); 16G still fits
+          # any vince userdata (even the 32 GB model has ~23.5G)
+          bash tools/mkiosroot.sh "$OS" "$SYSOS" "$APPOS" ios16-root.img 16G
           ls -la ios16-root.img
           df -h /
 
