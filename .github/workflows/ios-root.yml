@@ -18,6 +18,10 @@ jobs:
           rm -f ipsw.ipsw
           ls -la dmgs/
           df -h /
+      - name: Free disk space (remove Xcode)
+        run: |
+          sudo rm -rf /Applications/Xcode*.app || true
+          df -h /
       - name: Mount OS volume
         run: |
           hdiutil attach dmgs/087-86698-044.dmg -mountpoint /Volumes/os -nobrowse -readonly
