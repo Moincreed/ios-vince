@@ -93,6 +93,9 @@ jobs:
         run: |
           export PATH="/usr/local/bin:/usr/sbin:/sbin:$PATH"
           set -x
+          # upstream ships one stray CRLF on the script's last line; bash only
+          # reaches it AFTER the image is fully built, then dies with exit 127
+          sed -i 's/\r$//' tools/mkiosroot.sh
           OS=$(ls work/dmgs/087-86698-*.dmg | head -1)
           SYSOS=$(ls work/dmgs/087-86593-*.dmg | head -1)
           APPOS=$(ls work/dmgs/087-86622-*.dmg | head -1)
