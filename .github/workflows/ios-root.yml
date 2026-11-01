@@ -3,8 +3,8 @@ on:
   workflow_dispatch:
 jobs:
   build:
-    runs-on: macos-14
-    timeout-minutes: 90
+    runs-on: macos-13
+    timeout-minutes: 110
     steps:
       - uses: actions/checkout@v4
       - name: Download IPSW
@@ -22,6 +22,7 @@ jobs:
         run: |
           sudo rm -rf /Applications/Xcode*.app || true
           df -h /
+          df -h /System/Volumes/Data
       - name: Mount OS volume
         run: |
           hdiutil attach dmgs/087-86698-044.dmg -mountpoint /Volumes/os -nobrowse -readonly
