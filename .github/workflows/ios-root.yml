@@ -85,7 +85,10 @@ jobs:
           df -h /
       - name: Convert to raw
         run: |
-          rm -rf dmgs
+          hdiutil convert ios16-root.dmg -format UDRW -o ios16-root.raw
+          mv ios16-root.raw.dmg ios16-root.raw
+          rm -f ios16-root.dmg
+          ls -la ios16-root.raw
           df -h /
           hdiutil convert ios16-root.dmg -format UDRW -o ios16-root.raw
           rm -f ios16-root.dmg
