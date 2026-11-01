@@ -1,4 +1,4 @@
-#!/bin/bash
+﻿#!/bin/bash
 # Build the SWEET iOS root: one case-sensitive HFS+ image holding an iOS OS
 # root filesystem plus its cryptexes, for the userdata partition (rd=ufsroot0).
 #
@@ -61,10 +61,16 @@ trap cleanup EXIT
 # Keep the .dmg name: apfs-fuse only parses UDIF images (the OS one is UDIF,
 # the cryptexes are raw APFS) when the file name ends in .dmg.
 apfs_mount() {
-	ln -s "$1" "$work/$2.dmg"
+	local src
+	if tail -c 512 "$1" | grep -aq koly; then
+		src="$work/$2.dmg"
+	else
+		src="$work/$2"
+	fi
+	ln -s "$1" "$src"
 	mkdir "$work/$2"
 	# As root: a user's FUSE mount is unreadable to the root rsync below.
-	sudo "$(command -v apfs-fuse)" "$work/$2.dmg" "$work/$2"
+	sudo "$(command -v apfs-fuse)" "$src" "$work/$2"
 	mounts+=("$work/$2")
 }
 apfs_mount "$os" os
@@ -133,3 +139,4 @@ sudo umount "$work/root"
 # differently from Apple's tables; let fsck_hfs rewrite them, then verify.
 fsck.hfsplus -f -y "$out" | grep -v 'Illegal name' || true
 fsck.hfsplus -f -n "$out"
+
