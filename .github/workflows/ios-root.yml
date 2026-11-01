@@ -48,7 +48,8 @@ jobs:
           DT=$(find work/dt -name "*.im4p" | head -1)
           ./ipsw img4 im4p extract "$DT" -o d22ap.adt || echo "dt extraction failed (optional)"
           ls -la d22ap.adt || true
-      - name: Convert OS dmg (ADC to raw)
+      - name: Note OS dmg is raw APFS
+        run: echo "OS dmg is raw APFS, adaptive mount handles it"
         run: |
           sudo apt-get install -y dmg2img
           cd work/dmgs
