@@ -51,12 +51,12 @@ jobs:
           ls /mnt/appos/ || true
       - name: Create 10G HFS+ root image
         run: |
-          mkfs.hfsplus -s -J -v iOSRoot work/ios16-root.img
-          ls -la work/ios16-root.img
+          mkfs.hfsplus -s -J -v iOSRoot ios16-root.img
+          ls -la ios16-root.img
       - name: Mount HFS+ image
         run: |
           sudo mkdir -p /mnt/iosroot
-          sudo mount -t hfsplus -o loop,force work/ios16-root.img /mnt/iosroot
+          sudo mount -t hfsplus -o loop,force ios16-root.img /mnt/iosroot
       - name: Copy OS root
         run: |
           sudo rsync -aH --numeric-ids /mnt/os/ /mnt/iosroot/
@@ -90,10 +90,10 @@ jobs:
           sync
       - name: Compress
         run: |
-          gzip -1 work/ios16-root.img
-          ls -la work/ios16-root.img.gz
+          gzip -1 ios16-root.img
+          ls -la ios16-root.img.gz
       - name: Publish to release
         run: |
-          gh release upload qemu-demo work/ios16-root.img.gz --clobber -R zjh3215588/ios-vince
+          gh release upload qemu-demo ios16-root.img.gz --clobber -R zjh3215588/ios-vince
         env:
           GH_TOKEN: ${{ github.token }}
