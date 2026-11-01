@@ -26,7 +26,7 @@ jobs:
           ls /Volumes/sysos/ || true
       - name: Mount AppOS cryptex
         run: |
-          hdiutil attach dmgs/087-86622-047.dmg -mountpoint /Volumes/appos -nobrowse -readonly
+          hdiutil attach dmgs/087-86622-047.dmg -mountpoint /Volumes/appos -nobrowse -readonly || echo "AppOS optional for A11"
           ls /Volumes/appos/ || true
       - name: Create 16G HFS+ root image
         run: |
