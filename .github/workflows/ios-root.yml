@@ -15,7 +15,9 @@ jobs:
         run: |
           mkdir -p dmgs
           unzip -o ipsw.ipsw "087-*.dmg" -d dmgs/ >/dev/null
+          rm -f ipsw.ipsw
           ls -la dmgs/
+          df -h /
       - name: Mount OS volume
         run: |
           hdiutil attach dmgs/087-86698-044.dmg -mountpoint /Volumes/os -nobrowse -readonly
@@ -28,13 +30,15 @@ jobs:
         run: |
           hdiutil attach dmgs/087-86622-047.dmg -mountpoint /Volumes/appos -nobrowse -readonly || echo "AppOS optional for A11"
           ls /Volumes/appos/ || true
-      - name: Create 16G HFS+ root image
+      - name: Create 6G HFS+ root image
         run: |
-          hdiutil create -size 16g -fs "Case-sensitive HFS+" -volname iOSRoot -attach ios16-root
+          hdiutil create -size 6g -fs "Case-sensitive HFS+" -volname iOSRoot -attach ios16-root
           ls /Volumes/iOSRoot/
+          df -h /
       - name: Copy OS root
         run: |
           sudo rsync -aH --numeric-ids /Volumes/os/ /Volumes/iOSRoot/
+          df -h /
       - name: Copy cryptexes
         run: |
           sudo mkdir -p /Volumes/iOSRoot/private/preboot/Cryptexes/OS
@@ -71,10 +75,16 @@ jobs:
           hdiutil detach /Volumes/sysos -force || true
           hdiutil detach /Volumes/appos -force || true
           hdiutil detach /Volumes/iOSRoot -force || true
+          rm -rf dmgs
+          df -h /
       - name: Convert to raw
         run: |
           hdiutil convert ios16-root.dmg -format UDRW -o ios16-root.raw
+          rm -f ios16-root.dmg
           ls -la ios16-root.raw
+          df -h /
+      - name: Compress
+        run: |
           gzip -1 ios16-root.raw
           ls -la ios16-root.raw.gz
       - name: Publish to release
@@ -82,8 +92,3 @@ jobs:
           gh release upload qemu-demo ios16-root.raw.gz d22ap.adt --clobber -R zjh3215588/ios-vince
         env:
           GH_TOKEN: ${{ github.token }}
-      - name: Upload artifact copy
-        uses: actions/upload-artifact@v4
-        with:
-          name: ios16-root
-          path: ios16-root.raw.gz
