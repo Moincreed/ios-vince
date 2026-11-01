@@ -26,18 +26,23 @@ jobs:
         run: |
           hdiutil attach dmgs/087-86593-047.dmg -mountpoint /Volumes/sysos -nobrowse -readonly
           ls /Volumes/sysos/ || true
+          rm -f dmgs/087-86593-047.dmg
       - name: Mount AppOS cryptex
         run: |
           hdiutil attach dmgs/087-86622-047.dmg -mountpoint /Volumes/appos -nobrowse -readonly || echo "AppOS optional for A11"
           ls /Volumes/appos/ || true
-      - name: Create 6G HFS+ root image
+          rm -f dmgs/087-86622-047.dmg
+      - name: Create 8G HFS+ root image
         run: |
           hdiutil create -size 6g -fs "Case-sensitive HFS+" -volname iOSRoot -attach ios16-root
           ls /Volumes/iOSRoot/
           df -h /
       - name: Copy OS root
         run: |
+          rm -f dmgs/087-86698-044.dmg
+          df -h /
           sudo rsync -aH --numeric-ids /Volumes/os/ /Volumes/iOSRoot/
+          df -h /
           df -h /
       - name: Copy cryptexes
         run: |
@@ -79,6 +84,8 @@ jobs:
           df -h /
       - name: Convert to raw
         run: |
+          rm -rf dmgs
+          df -h /
           hdiutil convert ios16-root.dmg -format UDRW -o ios16-root.raw
           rm -f ios16-root.dmg
           ls -la ios16-root.raw
