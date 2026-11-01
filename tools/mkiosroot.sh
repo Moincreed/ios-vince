@@ -62,13 +62,14 @@ trap cleanup EXIT
 # the cryptexes are raw APFS) when the file name ends in .dmg.
 apfs_mount() {
 	local src
+	mkdir "$work/$2"
+	local src
 	if tail -c 512 "$1" | grep -aq koly; then
 		src="$work/$2.dmg"
 	else
-		src="$work/$2"
+		src="$work/$2.link"
 	fi
 	ln -s "$1" "$src"
-	mkdir "$work/$2"
 	# As root: a user's FUSE mount is unreadable to the root rsync below.
 	sudo "$(command -v apfs-fuse)" "$src" "$work/$2"
 	mounts+=("$work/$2")
