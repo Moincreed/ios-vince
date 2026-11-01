@@ -1,0 +1,64 @@
+name: ios-root
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y hfsprogs apfs-fuse rsync android-sdk-libsparse-utils unzip jq
+      - name: Download ipsw CLI
+        run: |
+          ASSET_URL=$(curl -sL https://api.github.com/repos/blacktop/ipsw/releases/latest | jq -r '.assets[] | select(.name | test("linux_x86_64.tar.gz$")) | .browser_download_url' | head -1)
+          echo "ipsw CLI: $ASSET_URL"
+          curl -sL -o ipsw.tar.gz "$ASSET_URL"
+          tar xzf ipsw.tar.gz
+          ./ipsw --version
+      - name: Download IPSW
+        run: |
+          curl -sS -L --retry 3 -o ipsw.ipsw "https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw"
+          ls -la ipsw.ipsw
+      - name: Extract DMGs and DeviceTree
+        run: |
+          mkdir -p work/dmgs
+          unzip -o ipsw.ipsw "*.dmg" -d work/dmgs/ >/dev/null
+          unzip -o ipsw.ipsw "*DeviceTree.d22ap.im4p" -d work/dt/ >/dev/null
+          ls -laS work/dmgs/
+      - name: Extract DeviceTree ADT
+        run: |
+          DT=$(find work/dt -name "*.im4p" | head -1)
+          ./ipsw img4 im4p extract "$DT" -o d22ap.adt
+          ls -la d22ap.adt
+      - name: Build iOS root (mkiosroot)
+        run: |
+          cd work/dmgs
+          OS=$(ls -S *.dmg | head -1)
+          SYSOS=$(ls -S *.dmg | head -2 | tail -1)
+          APPOS=$(ls -S *.dmg | head -3 | tail -1)
+          echo "OS=$OS SYSOS=$SYSOS APPOS=$APPOS"
+          cd ../..
+          sudo bash tools/mkiosroot.sh "work/dmgs/$OS" "work/dmgs/$SYSOS" "work/dmgs/$APPOS" /mnt/ios16-root.img 16G
+      - name: Apply vince tweaks
+        run: |
+          sudo mkdir -p /mnt/iosroot
+          sudo mount -t hfsplus -o loop,force /mnt/ios16-root.img /mnt/iosroot
+          sudo python3 tools/sweet-root-tweaks.py /mnt/iosroot
+          sync
+          sudo umount /mnt/iosroot
+      - name: Convert to sparse
+        run: |
+          img2simg /mnt/ios16-root.img ios16-root.simg
+          rm -f /mnt/ios16-root.img
+          ls -la ios16-root.simg
+          df -h /mnt
+      - name: Upload root image
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios16-root
+          path: |
+            ios16-root.simg
+            d22ap.adt
