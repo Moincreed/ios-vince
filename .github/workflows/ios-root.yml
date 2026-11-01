@@ -32,7 +32,8 @@ jobs:
         run: |
           mkdir -p work/dmgs
           bsdtar -xf ipsw.ipsw -C work/dmgs --include="*.dmg"
-          bsdtar -xf ipsw.ipsw -C work/dt --include="*DeviceTree.d22ap.im4p"
+          mkdir -p work/dt
+          bsdtar -xf ipsw.ipsw -C work/dt --include="*DeviceTree.d22ap.im4p" || echo "DT optional"
           rm -f ipsw.ipsw
           ls -laS work/dmgs/
       - name: Mount OS volume (apfs-fuse)
