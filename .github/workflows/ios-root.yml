@@ -174,6 +174,24 @@ jobs:
           sudo umount /mnt/iosroot
           sync
 
+      - name: Stub fsck binaries with /usr/bin/true (boot fsck deadlocks on the live root)
+        run: |
+          sudo mkdir -p /mnt/iosroot
+          sudo mount -t hfsplus -o loop,force ios16-root.img /mnt/iosroot
+          ls -la /mnt/iosroot/usr/bin/true || echo "WARNING: no /usr/bin/true"
+          for f in fsck fsck_hfs fsck_apfs; do
+            if [ -f "/mnt/iosroot/sbin/$f" ]; then
+              sudo cp -f /mnt/iosroot/usr/bin/true "/mnt/iosroot/sbin/$f"
+              sudo chown 0:0 "/mnt/iosroot/sbin/$f"
+              sudo chmod 755 "/mnt/iosroot/sbin/$f"
+              echo "stubbed /sbin/$f"
+            else
+              echo "no /sbin/$f in image"
+            fi
+          done
+          sudo umount /mnt/iosroot
+          sync
+
       - name: Upload plist blocks artifact
         uses: actions/upload-artifact@v4
         with:
