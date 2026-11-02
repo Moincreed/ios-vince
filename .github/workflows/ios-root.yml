@@ -178,14 +178,44 @@ jobs:
         run: |
           sudo mkdir -p /mnt/iosroot
           sudo mount -t hfsplus -o loop,force ios16-root.img /mnt/iosroot
-          ls -la /mnt/iosroot/bin/sh || echo "WARNING: no /bin/sh"
-          printf '#!/bin/sh\nexit 0\n' > /tmp/stub
-          for f in fsck fsck_hfs fsck_apfs; do
+          echo "--- /sbin ---"; ls /mnt/iosroot/sbin/ | head -40
+          echo "--- /usr/bin ---"; ls /mnt/iosroot/usr/bin/ | head -40
+          python3 - <<'EOF'
+          import struct
+
+          # minimal arm64 Mach-O: exit(0)
+          code = struct.pack('<III', 0xD2800000, 0xD2800030, 0xD4000001)  # movz x0,#0; movz x16,#1; svc #0
+          code_off = 0x188
+          total = code_off + len(code)
+          seg_cmds = 72
+          thread_state = 68 * 4  # 272 bytes, 68 u32 words
+          unixthread_size = 16 + thread_state
+          sizeofcmds = seg_cmds + unixthread_size
+
+          out = bytearray()
+          out += struct.pack('<IiiIIIII', 0xFEEDFACF, 0x0100000C, 0, 2, 2, sizeofcmds, 0, 0)
+          # LC_SEGMENT_64 __TEXT
+          out += struct.pack('<II16sQQQQIIII', 0x19, 72, b'__TEXT\x00' + b'\x00'*9,
+                             0x100000000, 0x4000, 0, total, 5, 5, 0, 0)
+          # LC_UNIXTHREAD
+          out += struct.pack('<IIII', 0x05, unixthread_size, 6, 68)
+          st = bytearray(thread_state)
+          struct.pack_into('<Q', st, 29*8 + 8*3, 0x100004000)   # sp  (offset 248)
+          struct.pack_into('<Q', st, 29*8 + 8*4, 0x100000000 + code_off)  # pc  (offset 256)
+          struct.pack_into('<I', st, 29*8 + 8*5, 0)          # cpsr (offset 264)
+          out += st
+          out += b'\x00' * (code_off - len(out))
+          out += code
+          assert len(out) == total, (len(out), total)
+          open('/tmp/truestub', 'wb').write(bytes(out))
+          print('stub Mach-O: %d bytes' % total)
+          EOF
+          for f in fsck fsck_apfs; do
             if [ -e "/mnt/iosroot/sbin/$f" ]; then
-              sudo cp -f /tmp/stub "/mnt/iosroot/sbin/$f"
+              sudo cp -f /tmp/truestub "/mnt/iosroot/sbin/$f"
               sudo chown 0:0 "/mnt/iosroot/sbin/$f"
               sudo chmod 755 "/mnt/iosroot/sbin/$f"
-              echo "stubbed /sbin/$f"
+              echo "stubbed /sbin/$f with Mach-O exit(0)"
             else
               echo "no /sbin/$f in image"
             fi
