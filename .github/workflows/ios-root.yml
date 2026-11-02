@@ -174,38 +174,12 @@ jobs:
           sudo umount /mnt/iosroot
           sync
 
-      - name: Stub fsck binaries + emit targeted patch sparse (few KB)
+      - name: Stub fsck with /usr/bin/vm_stat (valid signed binary, exits 0)
         run: |
           sudo mkdir -p /mnt/iosroot
           sudo mount -t hfsplus -o loop,force ios16-root.img /mnt/iosroot
+          ls -la /mnt/iosroot/usr/bin/vm_stat || echo "WARNING: no vm_stat"
           python3 - <<'EOF'
-          import struct, hashlib
-
-          # minimal arm64 Mach-O: exit(0)
-          code = struct.pack('<III', 0xD2800000, 0xD2800030, 0xD4000001)  # movz x0,#0; movz x16,#1; svc #0
-          code_off = 0x188
-          total = code_off + len(code)
-          seg_cmds = 72
-          thread_state = 68 * 4
-          unixthread_size = 16 + thread_state
-          sizeofcmds = seg_cmds + unixthread_size
-          out = bytearray()
-          out += struct.pack('<IiiIIIII', 0xFEEDFACF, 0x0100000C, 0, 2, 2, sizeofcmds, 0, 0)
-          out += struct.pack('<II16sQQQQIIII', 0x19, 72, b'__TEXT\x00' + b'\x00'*9,
-                             0x100000000, 0x4000, 0, total, 5, 5, 0, 0)
-          out += struct.pack('<IIII', 0x05, unixthread_size, 6, 68)
-          st = bytearray(thread_state)
-          struct.pack_into('<Q', st, 248, 0x100004000)
-          struct.pack_into('<Q', st, 256, 0x100000000 + code_off)
-          struct.pack_into('<I', st, 264, 0)
-          out += st
-          out += b'\x00' * (code_off - len(out))
-          out += code
-          assert len(out) == total
-          open('/tmp/truestub', 'wb').write(bytes(out))
-          print('stub Mach-O: %d bytes' % total)
-          print('stub sha256: %s' % hashlib.sha256(bytes(out)).hexdigest())
-
           # capture the ORIGINAL fsck/fsck_apfs first blocks (search keys) BEFORE stubbing
           for name in ('fsck', 'fsck_apfs'):
               p = '/mnt/iosroot/sbin/' + name
@@ -219,10 +193,10 @@ jobs:
           EOF
           for f in fsck fsck_apfs; do
             if [ -e "/mnt/iosroot/sbin/$f" ]; then
-              sudo cp -f /tmp/truestub "/mnt/iosroot/sbin/$f"
+              sudo cp -f /mnt/iosroot/usr/bin/vm_stat "/mnt/iosroot/sbin/$f"
               sudo chown 0:0 "/mnt/iosroot/sbin/$f"
               sudo chmod 755 "/mnt/iosroot/sbin/$f"
-              echo "stubbed /sbin/$f"
+              echo "stubbed /sbin/$f with vm_stat"
             fi
           done
           sudo umount /mnt/iosroot
@@ -254,10 +228,6 @@ jobs:
                   img.seek(pos)
               return -1
 
-          stub = open('/tmp/truestub', 'rb').read()
-          stub_block_content = bytearray(BLOCK)
-          stub_block_content[:len(stub)] = stub
-
           patches = []  # (block_index, 4096 bytes)
           for name in ('fsck', 'fsck_apfs'):
               kp = '/tmp/orig_' + name
@@ -267,7 +237,10 @@ jobs:
               blk = find_block(key)
               print('orig %s at block %d (byte 0x%X)' % (name, blk, blk * BLOCK))
               assert blk >= 0
-              patches.append((blk, bytes(stub_block_content)))
+              img = open('ios16-root.img', 'rb')
+              img.seek(blk * BLOCK)
+              data = img.read(BLOCK)   # the stubbed (vm_stat) first block as it now exists
+              patches.append((blk, data))
 
           assert patches, 'no fsck files found'
           patches.sort()
