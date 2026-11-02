@@ -106,6 +106,14 @@ jobs:
           ls -la ios16-root.img
           df -h /
 
+      - name: Apply SWEET bring-up tweaks (author script; _PanicOnCrasX etc.)
+        run: |
+          sudo mkdir -p /mnt/iosroot
+          sudo mount -t hfsplus -o loop,force ios16-root.img /mnt/iosroot
+          sudo python3 tools/sweet-root-tweaks.py /mnt/iosroot
+          sudo umount /mnt/iosroot
+          sync
+
       - name: Free intermediate space
         run: |
           rm -rf work/dmgs apfs-fuse
