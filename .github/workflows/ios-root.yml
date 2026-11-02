@@ -129,7 +129,10 @@ jobs:
               if not isinstance(jobs, dict):
                   continue
               for l in list(jobs.keys()):
-                  prog = jobs[l].get('ProgramArguments') or []
+                  job = jobs[l]
+                  if not isinstance(job, dict):
+                      continue
+                  prog = job.get('ProgramArguments') or []
                   if 'fsck' in l.lower() or any('fsck' in str(a).lower() for a in prog):
                       removed.append((key, l, prog))
                       del jobs[l]
