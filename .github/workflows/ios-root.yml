@@ -133,8 +133,9 @@ jobs:
                   if not isinstance(job, dict):
                       continue
                   prog = job.get('ProgramArguments') or []
-                  if 'fsck' in l.lower() or any('fsck' in str(a).lower() for a in prog):
-                      removed.append((key, l, prog))
+                  text = ' '.join(str(a) for a in prog) + ' ' + str(job.get('Program') or '')
+                  if 'fsck' in l.lower() or 'fsck' in text.lower():
+                      removed.append((key, l, text))
                       del jobs[l]
           new = plistlib.dumps(pl, fmt=plistlib.FMT_BINARY)
           with open(path, 'wb') as f:
