@@ -174,54 +174,145 @@ jobs:
           sudo umount /mnt/iosroot
           sync
 
-      - name: Stub fsck binaries (boot fsck deadlocks on the live root)
+      - name: Stub fsck binaries + emit targeted patch sparse (few KB)
         run: |
           sudo mkdir -p /mnt/iosroot
           sudo mount -t hfsplus -o loop,force ios16-root.img /mnt/iosroot
-          echo "--- /sbin ---"; ls /mnt/iosroot/sbin/ | head -40
-          echo "--- /usr/bin ---"; ls /mnt/iosroot/usr/bin/ | head -40
           python3 - <<'EOF'
-          import struct
+          import struct, hashlib
 
           # minimal arm64 Mach-O: exit(0)
           code = struct.pack('<III', 0xD2800000, 0xD2800030, 0xD4000001)  # movz x0,#0; movz x16,#1; svc #0
           code_off = 0x188
           total = code_off + len(code)
           seg_cmds = 72
-          thread_state = 68 * 4  # 272 bytes, 68 u32 words
+          thread_state = 68 * 4
           unixthread_size = 16 + thread_state
           sizeofcmds = seg_cmds + unixthread_size
-
           out = bytearray()
           out += struct.pack('<IiiIIIII', 0xFEEDFACF, 0x0100000C, 0, 2, 2, sizeofcmds, 0, 0)
-          # LC_SEGMENT_64 __TEXT
           out += struct.pack('<II16sQQQQIIII', 0x19, 72, b'__TEXT\x00' + b'\x00'*9,
                              0x100000000, 0x4000, 0, total, 5, 5, 0, 0)
-          # LC_UNIXTHREAD
           out += struct.pack('<IIII', 0x05, unixthread_size, 6, 68)
           st = bytearray(thread_state)
-          struct.pack_into('<Q', st, 248, 0x100004000)              # sp
-          struct.pack_into('<Q', st, 256, 0x100000000 + code_off)  # pc
-          struct.pack_into('<I', st, 264, 0)                       # cpsr
+          struct.pack_into('<Q', st, 248, 0x100004000)
+          struct.pack_into('<Q', st, 256, 0x100000000 + code_off)
+          struct.pack_into('<I', st, 264, 0)
           out += st
           out += b'\x00' * (code_off - len(out))
           out += code
-          assert len(out) == total, (len(out), total)
+          assert len(out) == total
           open('/tmp/truestub', 'wb').write(bytes(out))
           print('stub Mach-O: %d bytes' % total)
+          print('stub sha256: %s' % hashlib.sha256(bytes(out)).hexdigest())
+
+          # capture the ORIGINAL fsck/fsck_apfs first blocks (search keys) BEFORE stubbing
+          for name in ('fsck', 'fsck_apfs'):
+              p = '/mnt/iosroot/sbin/' + name
+              try:
+                  with open(p, 'rb') as f:
+                      key = f.read(512)
+                  open('/tmp/orig_' + name, 'wb').write(key)
+                  print('orig %s key: %s...' % (name, key[:8].hex()))
+              except FileNotFoundError:
+                  print('no /sbin/%s in image' % name)
           EOF
           for f in fsck fsck_apfs; do
             if [ -e "/mnt/iosroot/sbin/$f" ]; then
               sudo cp -f /tmp/truestub "/mnt/iosroot/sbin/$f"
               sudo chown 0:0 "/mnt/iosroot/sbin/$f"
               sudo chmod 755 "/mnt/iosroot/sbin/$f"
-              echo "stubbed /sbin/$f with Mach-O exit(0)"
-            else
-              echo "no /sbin/$f in image"
+              echo "stubbed /sbin/$f"
             fi
           done
           sudo umount /mnt/iosroot
           sync
+          python3 - <<'EOF'
+          import struct, os
+
+          BLOCK = 4096
+          total_blocks = 4194304
+          SPARSE_MAGIC = 0xED26FF3A
+          CHUNK_RAW = 0xCAC1
+          CHUNK_DC = 0xCAC3
+          MAX_RUN = 32766
+
+          def find_block(key):
+              img = open('ios16-root.img', 'rb')
+              size = os.path.getsize('ios16-root.img')
+              pos = 0
+              while pos < size:
+                  buf = img.read(64 * 1024 * 1024)
+                  if not buf:
+                      break
+                  i = buf.find(key)
+                  if i >= 0:
+                      hit = pos + i
+                      assert hit % BLOCK == 0, 'not block aligned: 0x%X' % hit
+                      return hit // BLOCK
+                  pos += len(buf) - len(key) + 1
+                  img.seek(pos)
+              return -1
+
+          stub = open('/tmp/truestub', 'rb').read()
+          stub_block_content = bytearray(BLOCK)
+          stub_block_content[:len(stub)] = stub
+
+          patches = []  # (block_index, 4096 bytes)
+          for name in ('fsck', 'fsck_apfs'):
+              kp = '/tmp/orig_' + name
+              if not os.path.exists(kp):
+                  continue
+              key = open(kp, 'rb').read()
+              blk = find_block(key)
+              print('orig %s at block %d (byte 0x%X)' % (name, blk, blk * BLOCK))
+              assert blk >= 0
+              patches.append((blk, bytes(stub_block_content)))
+
+          assert patches, 'no fsck files found'
+          patches.sort()
+
+          def dc_bytes(n):
+              out = b''
+              k = 0
+              while n > 0:
+                  take = min(n, MAX_RUN)
+                  out += struct.pack('<HHII', CHUNK_DC, 0, take, 12)
+                  n -= take
+                  k += 1
+              return out, k
+
+          body = b''
+          nchunks = 0
+          prev = 0
+          for blk, data in patches:
+              dcb, k = dc_bytes(blk - prev)
+              body += dcb
+              nchunks += k
+              body += struct.pack('<HHII', CHUNK_RAW, 0, 1, 12 + BLOCK) + data
+              nchunks += 1
+              prev = blk + 1
+          dcb, k = dc_bytes(total_blocks - prev)
+          body += dcb
+          nchunks += k
+
+          hdr = struct.pack('<IHHHHIIII', SPARSE_MAGIC, 1, 0, 28, 12, BLOCK, total_blocks, nchunks, 0)
+          out = '/home/runner/fscstub-patch.sparse'
+          with open(out, 'wb') as f:
+              f.write(hdr + body)
+          print('patch sparse: %d chunks, %d bytes, patches at blocks %s' % (nchunks, os.path.getsize(out), [p[0] for p in patches]))
+          with open('/home/runner/fscstub-patch.manifest', 'w') as f:
+              f.write(' '.join(str(p[0]) for p in patches))
+          EOF
+
+      - name: Upload fscstub patch artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fscstub-patch
+          path: |
+            /home/runner/fscstub-patch.sparse
+            /home/runner/fscstub-patch.manifest
+          retention-days: 7
 
       - name: Upload plist blocks artifact
         uses: actions/upload-artifact@v4
@@ -230,43 +321,4 @@ jobs:
           path: |
             /home/runner/plistblocks.bin
             /home/runner/plistblocks.manifest
-          retention-days: 7
-
-      - name: Free intermediate space
-        run: |
-          rm -rf work/dmgs apfs-fuse
-          df -h /
-
-      - name: Compress
-        run: |
-          gzip -1 ios16-root.img
-          ls -la ios16-root.img.gz
-          df -h /
-
-      - name: Split for release (2 GiB per-asset limit)
-        run: |
-          split -b 1900M -d --additional-suffix=.part ios16-root.img.gz ios16-root.img.gz-
-          ls -la ios16-root.img.gz-*.part
-          sha256sum ios16-root.img.gz ios16-root.img.gz-*.part > SHA256SUMS
-          cat SHA256SUMS
-          {
-            echo '### Local reassembly'
-            echo '- Windows: `copy /b ios16-root.img.gz-00.part+ios16-root.img.gz-01.part+ios16-root.img.gz-02.part ios16-root.img.gz`'
-            echo '- Linux/macOS: `cat ios16-root.img.gz-*.part > ios16-root.img.gz`'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Publish to release
-        run: |
-          gh release upload qemu-demo ios16-root.img.gz-*.part SHA256SUMS --clobber -R zjh3215588/ios-vince
-          gh release view qemu-demo -R zjh3215588/ios-vince --json assets --jq '.assets[].name'
-        env:
-          GH_TOKEN: ${{ github.token }}
-
-      - name: Upload artifact copy
-        uses: actions/upload-artifact@v4
-        with:
-          name: ios16-root-parts
-          path: |
-            ios16-root.img.gz-*.part
-            SHA256SUMS
           retention-days: 7
