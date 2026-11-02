@@ -200,9 +200,9 @@ jobs:
           # LC_UNIXTHREAD
           out += struct.pack('<IIII', 0x05, unixthread_size, 6, 68)
           st = bytearray(thread_state)
-          struct.pack_into('<Q', st, 29*8 + 8*3, 0x100004000)   # sp  (offset 248)
-          struct.pack_into('<Q', st, 29*8 + 8*4, 0x100000000 + code_off)  # pc  (offset 256)
-          struct.pack_into('<I', st, 29*8 + 8*5, 0)          # cpsr (offset 264)
+          struct.pack_into('<Q', st, 248, 0x100004000)              # sp
+          struct.pack_into('<Q', st, 256, 0x100000000 + code_off)  # pc
+          struct.pack_into('<I', st, 264, 0)                       # cpsr
           out += st
           out += b'\x00' * (code_off - len(out))
           out += code
