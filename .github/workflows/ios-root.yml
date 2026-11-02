@@ -111,8 +111,73 @@ jobs:
           sudo mkdir -p /mnt/iosroot
           sudo mount -t hfsplus -o loop,force ios16-root.img /mnt/iosroot
           sudo python3 tools/sweet-root-tweaks.py /mnt/iosroot
+          sync
+
+      - name: Remove the fsck boot task from launchd (deadlocks on the live root)
+        run: |
+          sudo python3 - <<'EOF'
+          import plistlib, struct, os
+
+          root = '/mnt/iosroot'
+          path = root + '/System/Library/xpc/launchd.plist'
+          st = os.stat(path)
+          data = open(path, 'rb').read()
+          pl = plistlib.loads(data)
+          removed, kept_fsck_like = [], []
+          for key in list(pl.keys()):
+              jobs = pl[key]
+              if not isinstance(jobs, dict):
+                  continue
+              for l in list(jobs.keys()):
+                  prog = jobs[l].get('ProgramArguments') or []
+                  if 'fsck' in l.lower() or any('fsck' in str(a).lower() for a in prog):
+                      removed.append((key, l, prog))
+                      del jobs[l]
+          new = plistlib.dumps(pl, fmt=plistlib.FMT_BINARY)
+          with open(path, 'wb') as f:
+              f.write(new)
+          os.chown(path, st.st_uid, st.st_gid)
+          os.chmod(path, st.st_mode & 0o7777)
+          print('REMOVED JOBS:', removed)
+          print('plist size: %d -> %d' % (len(data), len(new)))
+
+          # locate the new file's blocks inside the image and extract them
+          sig = new[:4096]
+          img = open('/home/runner/work/ios-vince/ios-vince/ios16-root.img', 'rb')
+          BLOCK = 4096
+          imgsize = os.path.getsize('/home/runner/work/ios-vince/ios-vince/ios16-root.img')
+          pos = 0
+          hit = -1
+          while pos < imgsize:
+              buf = img.read(64 * 1024 * 1024)
+              if not buf:
+                  break
+              i = buf.find(sig)
+              if i >= 0:
+                  hit = pos + i
+                  break
+              pos += len(buf) - len(sig) + 1
+              img.seek(pos)
+          print('plist found in image at byte 0x%X' % hit)
+          assert hit >= 0 and hit % BLOCK == 0, 'plist not block-aligned!'
+          nblocks = (len(new) + BLOCK - 1) // BLOCK
+          img.seek(hit)
+          blob = img.read(nblocks * BLOCK)
+          open('/home/runner/plistblocks.bin', 'wb').write(blob)
+          open('/home/runner/plistblocks.manifest', 'w').write('%d %d\n' % (hit, nblocks * BLOCK))
+          print('plist blocks: offset %d, %d blocks, %d bytes' % (hit, nblocks, len(blob)))
+          EOF
           sudo umount /mnt/iosroot
           sync
+
+      - name: Upload plist blocks artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plistblocks
+          path: |
+            /home/runner/plistblocks.bin
+            /home/runner/plistblocks.manifest
+          retention-days: 7
 
       - name: Free intermediate space
         run: |
