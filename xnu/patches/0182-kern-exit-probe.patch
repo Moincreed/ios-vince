@@ -1,0 +1,96 @@
+xnu: 0182 kern_exit proc_exit exit-path probes for the fsck boot-task deadlock
+
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -2097,6 +2097,7 @@
+ 	int knote_hint;
+ 
+ 	uth = current_uthread();
++	printf("EXIT_PROBE A_entry pid=%d\n", proc_pid(p));
+ 
+ 	proc_lock(p);
+ 	proc_transstart(p, 1, 0);
+@@ -2121,6 +2122,7 @@
+ 	}
+ 
+ 	p->p_lflag |= P_LPEXIT;
++	printf("EXIT_PROBE B_post_terminate pid=%d\n", proc_pid(p));
+ 
+ 	/*
+ 	 * Other kernel threads may be in the middle of signalling this process.
+@@ -2134,6 +2136,7 @@
+ 		}
+ 		p->p_sigwaitcnt--;
+ 	}
++	printf("EXIT_PROBE C_post_sigdrain pid=%d\n", proc_pid(p));
+ 
+ 	proc_unlock(p);
+ 	pid = proc_getpid(p);
+@@ -2156,6 +2159,8 @@
+ 	 */
+ 
+ 	proc_refdrain(p);
++	printf("EXIT_PROBE D1_pre_refdrain pid=%d\n", proc_pid(p));
++	printf("EXIT_PROBE D2_post_refdrain pid=%d\n", proc_pid(p));
+ 
+ 	/* if any pending cpu limits action, clear it */
+ 	task_clear_cpuusage(proc_task(p), TRUE);
+@@ -2169,12 +2174,15 @@
+ 	 * This may block!
+ 	 */
+ 	fdt_invalidate(p);
++	printf("EXIT_PROBE E1_pre_fdt pid=%d\n", proc_pid(p));
++	printf("EXIT_PROBE E2_post_fdt pid=%d\n", proc_pid(p));
+ 
+ 	/*
+ 	 * Once all the knotes, kqueues & workloops are destroyed, get rid of the
+ 	 * workqueue.
+ 	 */
+ 	workq_exit(p);
++	printf("EXIT_PROBE F_post_workq pid=%d\n", proc_pid(p));
+ 
+ 	if (uth->uu_lowpri_window) {
+ 		/*
+@@ -2255,12 +2263,15 @@
+ 				if (tp != TTY_NULL) {
+ 					tty_lock(tp);
+ 					(void) ttywait(tp);
++	printf("EXIT_PROBE H1_pre_ttywait pid=%d\n", proc_pid(p));
++	printf("EXIT_PROBE H2_post_ttywait pid=%d\n", proc_pid(p));
+ 					tty_unlock(tp);
+ 				}
+ 
+ 				context.vc_thread = NULL;
+ 				context.vc_ucred = kauth_cred_proc_ref(p);
+ 				VNOP_REVOKE(ttyvp, REVOKEALL, &context);
++	printf("EXIT_PROBE I_post_revoke pid=%d\n", proc_pid(p));
+ 				if (cttyflag) {
+ 					/*
+ 					 * Release the extra usecount taken in cttyopen.
+@@ -2299,6 +2310,8 @@
+ 	proc_limitsetcur_fsize(p, RLIM_INFINITY);
+ 
+ 	(void)acct_process(p);
++	printf("EXIT_PROBE J1_pre_acct pid=%d\n", proc_pid(p));
++	printf("EXIT_PROBE J2_post_acct pid=%d\n", proc_pid(p));
+ 
+ 	proc_list_lock();
+ 
+@@ -2312,6 +2325,8 @@
+ 
+ 	/* wait till parentrefs are dropped and grant no more */
+ 	proc_childdrainstart(p);
++	printf("EXIT_PROBE K1_pre_childdrain pid=%d\n", proc_pid(p));
++	printf("EXIT_PROBE K2_post_childdrain pid=%d\n", proc_pid(p));
+ 	while ((q = p->p_children.lh_first) != NULL) {
+ 		if (q->p_stat == SZOMB) {
+ 			if (p != q->p_pptr) {
+@@ -2413,6 +2428,8 @@
+ 		 * (rdar://problem/32126399).
+ 		 */
+ 		mac_proc_notify_exit(p);
++	printf("EXIT_PROBE L1_pre_mac pid=%d\n", proc_pid(p));
++	printf("EXIT_PROBE L2_post_mac pid=%d\n", proc_pid(p));
+ 	}
+ #endif
+ 
