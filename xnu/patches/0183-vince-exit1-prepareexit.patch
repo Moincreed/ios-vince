@@ -1,0 +1,15 @@
+xnu: 0183 disable proc_prepareexit call in exit1 (vince nofw2 semantic)
+
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1583,7 +1583,8 @@
+ 	proc_transend(p, 1);
+ 	proc_unlock(p);
+ 
+-	proc_prepareexit(p, rv, perf_notify);
++	/* VINCE: disabled - see nofw2 hand patch; triggers init_featureflags
+	   boot-task panic on CI builds. Kept as no-op to preserve layout. */
++	if (0) proc_prepareexit(p, rv, perf_notify);
+ 
+ 	/* Last thread to terminate will call proc_exit() */
+ 	task_terminate_internal(task);
