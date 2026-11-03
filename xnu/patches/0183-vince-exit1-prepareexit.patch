@@ -1,5 +1,9 @@
 xnu: 0183 disable proc_prepareexit call in exit1 (vince nofw2 semantic)
 
+The hand-built nofw2 kernel NOP'd this call and the boot got past the
+init_featureflags[16] exited handshake panic. Source-level equivalent
+for CI builds.
+
 --- a/bsd/kern/kern_exit.c
 +++ b/bsd/kern/kern_exit.c
 @@ -1583,7 +1583,8 @@
@@ -7,8 +11,7 @@ xnu: 0183 disable proc_prepareexit call in exit1 (vince nofw2 semantic)
  	proc_unlock(p);
  
 -	proc_prepareexit(p, rv, perf_notify);
-+	/* VINCE: disabled - see nofw2 hand patch; triggers init_featureflags
-	   boot-task panic on CI builds. Kept as no-op to preserve layout. */
++	/* VINCE: disabled - matches the hand-built nofw2 kernel NOP. */
 +	if (0) proc_prepareexit(p, rv, perf_notify);
  
  	/* Last thread to terminate will call proc_exit() */
