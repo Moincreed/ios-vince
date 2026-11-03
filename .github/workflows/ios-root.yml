@@ -174,29 +174,17 @@ jobs:
           sudo umount /mnt/iosroot
           sync
 
-      - name: Stub fsck with /usr/bin/vm_stat (valid signed binary, exits 0)
+      - name: Copy /usr/bin/sed over /sbin/fsck (real signed binary, exits on bad args)
         run: |
           sudo mkdir -p /mnt/iosroot
           sudo mount -t hfsplus -o loop,force ios16-root.img /mnt/iosroot
-          ls -la /mnt/iosroot/usr/bin/vm_stat || echo "WARNING: no vm_stat"
-          python3 - <<'EOF'
-          # capture the ORIGINAL fsck/fsck_apfs first blocks (search keys) BEFORE stubbing
-          for name in ('fsck', 'fsck_apfs'):
-              p = '/mnt/iosroot/sbin/' + name
-              try:
-                  with open(p, 'rb') as f:
-                      key = f.read(512)
-                  open('/tmp/orig_' + name, 'wb').write(key)
-                  print('orig %s key: %s...' % (name, key[:8].hex()))
-              except FileNotFoundError:
-                  print('no /sbin/%s in image' % name)
-          EOF
+          ls -la /mnt/iosroot/usr/bin/sed || echo "WARNING: no sed"
           for f in fsck fsck_apfs; do
             if [ -e "/mnt/iosroot/sbin/$f" ]; then
-              sudo cp -f /mnt/iosroot/usr/bin/vm_stat "/mnt/iosroot/sbin/$f"
+              sudo cp -f /mnt/iosroot/usr/bin/sed "/mnt/iosroot/sbin/$f"
               sudo chown 0:0 "/mnt/iosroot/sbin/$f"
               sudo chmod 755 "/mnt/iosroot/sbin/$f"
-              echo "stubbed /sbin/$f with vm_stat"
+              echo "stubbed /sbin/$f with sed"
             fi
           done
           sudo umount /mnt/iosroot
@@ -207,8 +195,6 @@ jobs:
           BLOCK = 4096
           total_blocks = 4194304
           SPARSE_MAGIC = 0xED26FF3A
-          CHUNK_RAW = 0xCAC1
-          CHUNK_DC = 0xCAC3
           MAX_RUN = 32766
 
           def find_block(key):
@@ -217,74 +203,67 @@ jobs:
               pos = 0
               while pos < size:
                   buf = img.read(64 * 1024 * 1024)
-                  if not buf:
-                      break
+                  if not buf: break
                   i = buf.find(key)
                   if i >= 0:
                       hit = pos + i
-                      assert hit % BLOCK == 0, 'not block aligned: 0x%X' % hit
+                      assert hit % BLOCK == 0, 'not aligned: 0x%X' % hit
                       return hit // BLOCK
                   pos += len(buf) - len(key) + 1
                   img.seek(pos)
               return -1
 
-          patches = []  # (block_index, 4096 bytes)
-          for name in ('fsck', 'fsck_apfs'):
-              kp = '/tmp/orig_' + name
-              if not os.path.exists(kp):
-                  continue
-              key = open(kp, 'rb').read()
-              blk = find_block(key)
-              print('orig %s at block %d (byte 0x%X)' % (name, blk, blk * BLOCK))
-              assert blk >= 0
-              img = open('ios16-root.img', 'rb')
-              img.seek(blk * BLOCK)
-              data = img.read(BLOCK)   # the stubbed (vm_stat) first block as it now exists
-              patches.append((blk, data))
-
-          assert patches, 'no fsck files found'
-          patches.sort()
-
           def dc_bytes(n):
-              out = b''
-              k = 0
+              o = b''; k = 0
               while n > 0:
                   take = min(n, MAX_RUN)
-                  out += struct.pack('<HHII', CHUNK_DC, 0, take, 12)
-                  n -= take
-                  k += 1
-              return out, k
+                  o += struct.pack('<HHII', 0xCAC3, 0, take, 12); n -= take; k += 1
+              return o, k
 
-          body = b''
-          nchunks = 0
-          prev = 0
-          for blk, data in patches:
-              dcb, k = dc_bytes(blk - prev)
-              body += dcb
-              nchunks += k
-              body += struct.pack('<HHII', CHUNK_RAW, 0, 1, 12 + BLOCK) + data
-              nchunks += 1
-              prev = blk + 1
-          dcb, k = dc_bytes(total_blocks - prev)
-          body += dcb
-          nchunks += k
+          # capture sed's first block as the search key (it was copied over fsck)
+          # we need to find where the COPY landed, which is the same as where the
+          # ORIGINAL fsck was. Search for sed's unique first bytes at the fsck position.
+          # Actually: after cp, the fsck position contains sed's data. Search for that.
+          sed_data = open('/mnt/iosroot-backup/sed_first_block', 'rb').read() if os.path.exists('/mnt/iosroot-backup/sed_first_block') else None
+          # Simpler: we know the ORIGINAL fsck block positions from previous runs
+          # Use the known positions
+          blocks = [2094525, 3057129]
+          img = open('ios16-root.img', 'rb')
+          img.seek(blocks[0] * BLOCK)
+          current = img.read(BLOCK)
+          img.close()
 
-          hdr = struct.pack('<IHHHHIIII', SPARSE_MAGIC, 1, 0, 28, 12, BLOCK, total_blocks, nchunks, 0)
-          out = '/home/runner/fscstub-patch.sparse'
-          with open(out, 'wb') as f:
-              f.write(hdr + body)
-          print('patch sparse: %d chunks, %d bytes, patches at blocks %s' % (nchunks, os.path.getsize(out), [p[0] for p in patches]))
-          with open('/home/runner/fscstub-patch.manifest', 'w') as f:
-              f.write(' '.join(str(p[0]) for p in patches))
+          def dc_bytes2(n):
+              o = b''; k = 0
+              while n > 0:
+                  take = min(n, MAX_RUN)
+                  o += struct.pack('<HHII', 0xCAC3, 0, take, 12); n -= take; k += 1
+              return o, k
+
+          body = b''; nchunks = 0; prev = 0
+          for blk in blocks:
+              dcb, k = dc_bytes2(blk - prev); body += dcb; nchunks += k
+              img = open('ios16-root.img', 'rb')
+              img.seek(blk * BLOCK)
+              data = img.read(BLOCK)
+              img.close()
+              body += struct.pack('<HHII', 0xCAC1, 0, 1, 12 + BLOCK) + data
+              nchunks += 1; prev = blk + 1
+          dcb, k = dc_bytes(total_blocks - prev); body += dcb; nchunks += k
+          hdr2 = struct.pack('<IHHHHIIII', SPARSE_MAGIC, 1, 0, 28, 12, BLOCK, total_blocks, nchunks, 0)
+          open('/home/runner/fsck-sed.sparse', 'wb').write(hdr2 + body)
+          print('patch sparse: %d bytes' % os.path.getsize('/home/runner/fsck-sed.sparse'))
+          with open('/home/runner/fsck-sed.manifest', 'w') as f:
+              f.write(' '.join(str(b) for b in blocks))
           EOF
 
-      - name: Upload fscstub patch artifact
+      - name: Upload fsck sed patch artifact
         uses: actions/upload-artifact@v4
         with:
-          name: fscstub-patch
+          name: fsck-sed-patch
           path: |
-            /home/runner/fscstub-patch.sparse
-            /home/runner/fscstub-patch.manifest
+            /home/runner/fsck-sed.sparse
+            /home/runner/fsck-sed.manifest
           retention-days: 7
 
       - name: Upload plist blocks artifact
