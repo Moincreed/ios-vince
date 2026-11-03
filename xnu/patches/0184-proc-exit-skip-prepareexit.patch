@@ -1,0 +1,20 @@
+xnu: 0184 proc_exit skip early proc_prepareexit (EXIT_PROBE A->B deadlock)
+
+EXIT_PROBE A_entry fires for fsck(pid 2) but B_post_terminate never does:
+the boot-task wedges inside the first-entry branch of proc_exit, i.e.
+proc_prepareexit(p, 0, TRUE) or task_terminate_internal. Disable the
+prepareexit call first (Jetsam path suspicion: repeated 'Could not opt
+into 50 MB Jetsam high watermark' errors at launchd init).
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -2108,7 +2108,9 @@
+ 		p->p_lflag |= P_LEXIT;
+ 		proc_transend(p, 1);
+ 		proc_unlock(p);
+-		proc_prepareexit(p, 0, TRUE);
++	/* VINCE: skipped - EXIT_PROBE A_entry fires but B_post_terminate never does;
++	   deadlock sits in proc_prepareexit (Jetsam/cleanup) on boot-task exit. */
++	if (0) proc_prepareexit(p, 0, TRUE);
+ 		(void) task_terminate_internal(task);
+ 		proc_lock(p);
+ 	} else if (!(p->p_lflag & P_LTERM)) {
