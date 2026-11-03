@@ -174,17 +174,17 @@ jobs:
           sudo umount /mnt/iosroot
           sync
 
-      - name: Copy /usr/bin/sed over /sbin/fsck (real signed binary, exits on bad args)
+      - name: Copy /sbin/mount over /sbin/fsck (exits instantly on bad args)
         run: |
           sudo mkdir -p /mnt/iosroot
           sudo mount -t hfsplus -o loop,force ios16-root.img /mnt/iosroot
-          ls -la /mnt/iosroot/usr/bin/sed || echo "WARNING: no sed"
+          ls -la /mnt/iosroot/sbin/mount || echo "WARNING: no mount"
           for f in fsck fsck_apfs; do
             if [ -e "/mnt/iosroot/sbin/$f" ]; then
-              sudo cp -f /mnt/iosroot/usr/bin/sed "/mnt/iosroot/sbin/$f"
+              sudo cp -f /mnt/iosroot/sbin/mount "/mnt/iosroot/sbin/$f"
               sudo chown 0:0 "/mnt/iosroot/sbin/$f"
               sudo chmod 755 "/mnt/iosroot/sbin/$f"
-              echo "stubbed /sbin/$f with sed"
+              echo "stubbed /sbin/$f with mount binary"
             fi
           done
           sudo umount /mnt/iosroot
