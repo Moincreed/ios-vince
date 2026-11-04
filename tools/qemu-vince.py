@@ -54,18 +54,25 @@ def build_image(payload):
     adt_pa = kernel_end + delta
     ba_pa = (adt_pa + adt_size + PAGE - 1) & ~(PAGE - 1)
     top = ba_pa + PAGE
-    img = bytearray(top - phys_base)
+    # Prelinked kernels (UniXNU kernel.macho) carry __PRELINK_TEXT below virt_base;
+    # take the image floor from the lowest segment PA so negative offsets cannot wrap.
+    seg_pas = []
     for i in range(nsegs):
         vmaddr, vmsize, foff, fsize = struct.unpack_from('<4Q', payload, 0x2a8 + 32 * i)
-        o = vmaddr + delta - phys_base
+        seg_pas.append(vmaddr + delta)
+    img_start = min(seg_pas + [phys_base]) & ~(PAGE - 1)
+    img = bytearray(top - img_start)
+    for i in range(nsegs):
+        vmaddr, vmsize, foff, fsize = struct.unpack_from('<4Q', payload, 0x2a8 + 32 * i)
+        o = vmaddr + delta - img_start
         img[o:o + fsize] = payload[foff:foff + fsize]
-    img[adt_pa - phys_base:adt_pa - phys_base + adt_size] = payload[adt_off:adt_off + adt_size]
+    img[adt_pa - img_start:adt_pa - img_start + adt_size] = payload[adt_off:adt_off + adt_size]
     ba = struct.pack('<HH4x4Q6QI4xQI', 2, 2, virt_base, phys_base, mem_size, top,
                      FB_BASE, 1, FB_STRIDE, FB_W, FB_H, 24, 0, adt_pa - delta, adt_size)
     ba += cmdline + b'\0' * 4 + struct.pack('<QQ', 0, mem_size)
     assert len(ba) == 736
-    img[ba_pa - phys_base:ba_pa - phys_base + len(ba)] = ba
-    return phys_base, bytes(img), ba_pa, entry_va + delta
+    img[ba_pa - img_start:ba_pa - img_start + len(ba)] = ba
+    return img_start, bytes(img), ba_pa, entry_va + delta
 
 
 def stub(ba_pa, entry_pa):
@@ -141,20 +148,20 @@ def main():
     os.makedirs(a.outdir, exist_ok=True)
     out = os.path.abspath(a.outdir)
 
-    phys_base, img, ba_pa, entry_pa = build_image(payload)
+    img_start, img, ba_pa, entry_pa = build_image(payload)
     open(f'{out}/ram.bin', 'wb').write(img)
     open(f'{out}/stub.bin', 'wb').write(stub(ba_pa, entry_pa))
-    print(f'phys_base={phys_base:#x} boot_args={ba_pa:#x} entry={entry_pa:#x}', file=sys.stderr)
+    print(f'img_start={img_start:#x} boot_args={ba_pa:#x} entry={entry_pa:#x}', file=sys.stderr)
 
     mon = f'{out}/mon.sock'
     if os.path.exists(mon):
         os.unlink(mon)
     mem_size = struct.unpack_from('<Q', payload, 0x40)[0]
-    ram_gib = max(4, -(-(phys_base + mem_size - 0x40000000) // (1 << 30)))
+    ram_gib = max(4, -(-(img_start + mem_size - 0x40000000) // (1 << 30)))
     cmd = ['qemu-system-aarch64', '-M', 'virt,gic-version=2', '-cpu', a.cpu, '-smp', '1', '-m', f'{ram_gib}G',
            '-nographic', '-serial', f'file:{out}/serial.txt', '-qmp', f'unix:{mon},server,nowait',
            '-d', 'int,guest_errors,unimp', '-D', f'{out}/qemu.log', '-no-reboot',
-           '-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',
+           '-device', f'loader,file={out}/ram.bin,addr={img_start:#x},force-raw=on',
            '-device', f'loader,file={out}/stub.bin,addr={STUB_PA:#x},force-raw=on',
            '-device', f'loader,addr={STUB_PA:#x},cpu-num=0']
 
