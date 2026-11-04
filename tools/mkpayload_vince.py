@@ -119,6 +119,24 @@ def add_ramdisk_to_adt(adt_blob, phys, size):
     return adt.serialize(root)
 
 
+def add_trustcache_to_adt(adt_blob, phys, size):
+    """arm_vm_prot_init reads /chosen/memory-map/TrustCache as a DTMemoryMapRange
+    {paddr, length} and phystokv()'s the paddr; an all-zero placeholder panics
+    with "illegal PA: 0" (arm_vm_init.c:385). This installs the true range."""
+    root, _ = adt.parse(adt_blob)
+    chosen = next(c for c in root.children if c.name == 'chosen')
+    mmap = next((c for c in chosen.children if c.name == 'memory-map'), None)
+    if mmap is None:
+        mmap = adt.Node()
+        mmap.props = [('name', 0, b'memory-map\0')]
+        chosen.children.append(mmap)
+    old = next((p for p in mmap.props if p[0] == 'TrustCache'), None)
+    if old is not None:
+        mmap.props.remove(old)
+    mmap.props.append(('TrustCache', 0, struct.pack('<2Q', phys, size)))
+    return adt.serialize(root)
+
+
 def adt_dram(adt_blob):
     root, _ = adt.parse(adt_blob)
     chosen = next(c for c in root.children if c.name == 'chosen')
@@ -126,7 +144,7 @@ def adt_dram(adt_blob):
             struct.unpack('<Q', chosen.prop('dram-size'))[0])
 
 
-def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
+def build(kernel_path, adt_path, cmdline, ramdisk_path=None, trustcache_path=None):
     buf = bytearray(open(kernel_path, 'rb').read())
     m = parse_macho(buf)
     nfix = apply_chained_fixups(buf, m)
@@ -134,7 +152,12 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
     text = m['segs'][0]
     assert text['name'] == '__TEXT' and text['fileoff'] == 0
 
-    virt_base = text['vmaddr'] & ~(0x2000000 - 1)
+    # vince/prelink: __PRELINK_TEXT and friends live BELOW __TEXT. The XNU
+    # arm_vm_prot_init granular helper rejects any VA outside
+    # [virt_base, virt_base + size), so the payload's virt_base must cover
+    # the lowest segment, not just __TEXT. (QEMU-verified: the old
+    # __TEXT-based base produced "illegal VA: 0xfffffff00427c000" panics.)
+    virt_base = min(s['vmaddr'] for s in segs) & ~(0x2000000 - 1)
     kernel_end = max(s['vmaddr'] + s['vmsize'] for s in segs)
     kernel_end = (kernel_end + PAGE - 1) & ~(PAGE - 1)
 
@@ -152,6 +175,18 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
         pieces.append((rd_va, rd_size, image))
         adt_blob = add_ramdisk_to_adt(adt_blob, rd_pa, rd_size)
         ramdisk = (hex(rd_pa), hex(rd_size))
+
+    if trustcache_path:
+        tc = open(trustcache_path, 'rb').read()
+        tc_size = (len(tc) + PAGE - 1) & ~(PAGE - 1)
+        tc_va = kernel_end
+        kernel_end = tc_va + tc_size
+        tc_pa = tc_va - virt_base + phys_base
+        pieces.append((tc_va, tc_size, tc))
+        adt_blob = add_trustcache_to_adt(adt_blob, tc_pa, tc_size)
+        trustcache = (hex(tc_pa), hex(tc_size))
+    else:
+        trustcache = None
 
     hdr_size = SEG_TABLE + 32 * len(pieces)
     out = bytearray(hdr_size)
@@ -176,7 +211,7 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
 
     info = dict(cputype=hex(m['cputype']), cpusub=m['cpusub'], fixups=nfix, virt_base=hex(virt_base),
                 entry=hex(m['entry']), kernel_end=hex(kernel_end), phys_base=hex(phys_base),
-                mem_size=hex(mem_size), ramdisk=ramdisk, size=len(out),
+                mem_size=hex(mem_size), ramdisk=ramdisk, trustcache=trustcache, size=len(out),
                 segs=[(s['name'], hex(s['vmaddr']), hex(s['vmsize'])) for s in segs])
     return bytes(out), info
 
@@ -186,10 +221,11 @@ if __name__ == '__main__':
     ap.add_argument('kernel', help='Path to kernel.development.vince Mach-O')
     ap.add_argument('adt', help='Path to vince.adt')
     ap.add_argument('out', help='Output payload path (e.g. artifacts/vince.payload)')
-    ap.add_argument('--cmdline', default='debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress wdt=-1 wdt_test=no_user_checkin sweettouch=0 sweetkeys=0')
+    ap.add_argument('--cmdline', default='debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress wdt=-1 wdt_test=no_user_check sweettouch=0 sweetkeys=0')
     ap.add_argument('--ramdisk', help='Optional root image for md0')
+    ap.add_argument('--trustcache', help='Optional static trust cache (installed behind the kernel and announced in /chosen/memory-map/TrustCache)')
     a = ap.parse_args()
-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk)
+    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.trustcache)
     open(a.out, 'wb').write(blob)
     print(f"[+] Vince XNU Payload written to {a.out} ({len(blob):,} bytes)")
     for k, v in info.items():
