@@ -1,0 +1,45 @@
+xnu: 0197 vince Pronto: CX/MX at TURBO, Linux start order first
+
+Mainline qcom_wcnss.c wcnss_start() raises the cx and mx power domains to
+their top level (msm8953 rpmpd: smpa2 / smpa7, TURBO 384) before starting
+Pronto, and always sets the NV flag and the Iris XO together. Vote CX/MX
+through RPM and try mode 3 (flag + Iris 48 MHz) first.
+
+diff --git a/bsd/dev/vince_smd.c b/bsd/dev/vince_smd.c
+index 1ab49ce..dca5731 100644
+--- a/bsd/dev/vince_smd.c
++++ b/bsd/dev/vince_smd.c
+@@ -777,6 +777,9 @@ vp_ctrl(const uint8_t *nv, uint32_t nv_len)
+ #define KVP_UV          0x00007675u     /* "uv" */
+ #define KVP_MA          0x0000616du     /* "ma" */
+ #define KVP_ENAB        0x62616e45u     /* "Enab" */
++#define RPM_SMPA        0x61706d73u     /* "smpa" (rpmpd power domains) */
++#define KVP_VLVL        0x6c766c76u     /* "vlvl" */
++#define RPM_LEVEL_TURBO 384u
+ #define SPMI_CORE_PA    0x0200f000u
+ #define SPMI_OBS_PA     0x02c00000u
+ 
+@@ -1115,6 +1118,14 @@ vince_iris_power(void)
+ 		printf("VINCE RPM: rpm_requests open failed %d (ours %u, RPM %u)\n", r, vr_get(&c, 0, 0), vr_get(&c, 1, 0));
+ 		return;
+ 	}
++	/*
++	 * Pronto's power domains at their top level first, as mainline qcom_wcnss.c wcnss_start()
++	 * (dev_pm_genpd_set_performance_state(INT_MAX), msm8953 rpmpd: VDDCX = smpa 2, VDDMX = smpa 7, max TURBO).
++	 */
++	for (uint32_t id = 2; id <= 7; id += 5) {
++		uint32_t kv[4] = { KVP_SWEN, 1, KVP_VLVL, RPM_LEVEL_TURBO };
++		(void)vr_request(&c, RPM_SMPA, id, kv, 2, id == 2 ? "VDDCX (smpa2) TURBO" : "VDDMX (smpa7) TURBO");
++	}
+ 	static const struct { uint32_t id, uv; const char *name; } l[4] = {
+ 		{ 5, 1800000, "L5 1.8 V (Iris dig)" }, { 7, 1800000, "L7 1.8 V (Iris XO)" },
+ 		{ 19, 1300000, "L19 1.3 V (Iris RF)" }, { 9, 3300000, "L9 3.3 V (Iris PA)" },
+@@ -1194,7 +1205,7 @@ vince_pronto_boot(void)
+ 			vince_iris_power();
+ 		}
+ 	}
+-	static const int modes[] = { 2, 6, 1, 0 };
++	static const int modes[] = { 3, 2, 6, 0 };
+ 	int only = -1, nmodes = (int)(sizeof(modes) / sizeof(modes[0]));
+ 	(void)PE_parse_boot_argn("vinceiris", &only, sizeof(only));
+ 	for (int m = 0; m < nmodes; m++) {
