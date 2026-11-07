@@ -1,0 +1,375 @@
+xnu: 0194 vince Iris power: RPM LDO and RF clock votes before Pronto start
+
+0193 on the phone: Iris XO 48 MHz keeps the firmware from starting, 19.2 MHz
+starts it but HAL_START still answers 38 with an empty radio name. Vote the
+Iris rails on through RPM (rpm_requests, edge 15: ldoa L5/L7 1.8 V, L19
+1.3 V, L9 3.3 V; clka rf_clk1/2), as Android does, and log the pm8953 LDO
+state (SPMI observer, read-only) before and after. Boot-arg vincerpm=0 skips.
+
+diff --git a/bsd/dev/vince_smd.c b/bsd/dev/vince_smd.c
+index b89ca11..984a0b7 100644
+--- a/bsd/dev/vince_smd.c
++++ b/bsd/dev/vince_smd.c
+@@ -26,6 +26,7 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/kalloc.h>
++#include <libkern/libkern.h>
+ #include "vince_smd.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -751,6 +752,340 @@ vp_ctrl(const uint8_t *nv, uint32_t nv_len)
+ 	return 0;
+ }
+ 
++/*
++ * ---- Iris power: RPM requests (mainline qcom_smd-rpm.c) and PMIC LDO state (read-only, SPMI observer) ----
++ *
++ * The Iris RF chip runs from pm8953 L5 (1.8 V dig), L7 (1.8 V XO), L19 (1.3 V RF) and L9 (3.3 V PA), all RPM
++ * resources ("ldoa"); Android's wcnss driver votes them on, LK may not. HAL_START answered 38 with an empty radio
++ * name, consistent with an unpowered Iris. Channel "rpm_requests" on SMD edge 15 in the global (legacy) tables,
++ * doorbell APCS IPC bit 0; the RPM side may use the word-access info layout.
++ */
++#define RPM_EDGE        15u
++#define RPM_REQ_SVC     0x00716572u     /* "req" */
++#define RPM_MSG_ID      0x2367736du     /* "msg#" */
++#define RPM_MSG_ERR     0x00727265u     /* "err" */
++#define RPM_LDOA        0x616f646cu     /* "ldoa" */
++#define RPM_CLKA        0x616b6c63u     /* "clka" (clock buffers) */
++#define KVP_SWEN        0x6e657773u     /* "swen" */
++#define KVP_UV          0x00007675u     /* "uv" */
++#define KVP_MA          0x0000616du     /* "ma" */
++#define KVP_ENAB        0x62616e45u     /* "Enab" */
++#define SPMI_CORE_PA    0x0200f000u
++#define SPMI_OBS_PA     0x02c00000u
++
++struct vr_ch {
++	vm_offset_t info, fifo;
++	uint32_t half;
++	bool word;
++};
++
++/* field f of our (remote = 0) or the RPM's (remote = 1) half: 0 state, 1..8 the flags, 9 tail, 10 head */
++static vm_offset_t
++vr_fa(struct vr_ch *c, int remote, int f, bool *is8)
++{
++	vm_offset_t b = c->info + (remote ? (c->word ? 44u : 20u) : 0u);
++	*is8 = false;
++	if (c->word) {
++		return b + 4u * (uint32_t)f;
++	}
++	if (f == 0) {
++		return b;
++	}
++	if (f <= 8) {
++		*is8 = true;
++		return b + 4u + (uint32_t)(f - 1);
++	}
++	return b + (f == 9 ? 12u : 16u);
++}
++
++static uint32_t
++vr_get(struct vr_ch *c, int remote, int f)
++{
++	bool is8;
++	vm_offset_t a = vr_fa(c, remote, f, &is8);
++	return is8 ? rd8(a) : rd32(a);
++}
++
++static void
++vr_set(struct vr_ch *c, int remote, int f, uint32_t v)
++{
++	bool is8;
++	vm_offset_t a = vr_fa(c, remote, f, &is8);
++	if (is8) {
++		wr8(a, (uint8_t)v);
++	} else {
++		wr32(a, v);
++	}
++}
++
++static void
++vr_kick(void)
++{
++	vince_smd_kick(1u << 0);
++}
++
++static bool
++vr_find(struct vr_ch *c)
++{
++	static const uint32_t alloc[2] = { 13, 266 }, info[2] = { 14, 138 }, fifo[2] = { 338, 202 };
++	for (int t = 0; t < 2; t++) {
++		uint32_t tsz = 0;
++		vm_offset_t tbl = vince_smd_item(alloc[t], &tsz);
++		if (!tbl) {
++			continue;
++		}
++		for (uint32_t i = 0; i < 64 && (i + 1) * 32 <= tsz; i++) {
++			vm_offset_t e = tbl + i * 32;
++			char nm[21];
++			for (int j = 0; j < 20; j++) {
++				char ch = (char)rd8(e + (uint32_t)j);
++				nm[j] = (ch >= 0x20 && ch < 0x7f) ? ch : 0;
++			}
++			nm[20] = 0;
++			uint32_t cid = rd32(e + 20), flags = rd32(e + 24);
++			if ((flags & 0xff) != RPM_EDGE || strncmp(nm, "rpm_requests", 20) != 0) {
++				continue;
++			}
++			uint32_t isz = 0, fsz = 0;
++			vm_offset_t io = vince_smd_item(info[t] + cid, &isz), fo = vince_smd_item(fifo[t] + cid, &fsz);
++			printf("VINCE RPM: rpm_requests cid %u table %d info %u bytes fifo %u bytes\n", cid, t, isz, fsz);
++			if (!io || !fo || (isz != 40 && isz != 88) || fsz < 0x100 || (fsz & (fsz - 1))) {
++				return false;
++			}
++			c->info = io;
++			c->fifo = fo;
++			c->half = fsz / 2;
++			c->word = isz == 88;
++			return true;
++		}
++	}
++	printf("VINCE RPM: no rpm_requests channel in the global SMD tables\n");
++	return false;
++}
++
++static int
++vr_open(struct vr_ch *c)
++{
++	printf("VINCE RPM: states before open: ours %u, RPM %u (%s layout)\n", vr_get(c, 0, 0), vr_get(c, 1, 0),
++	    c->word ? "word" : "byte");
++	if (vr_get(c, 0, 0) == ST_OPENED && vr_get(c, 1, 0) == ST_OPENED) {
++		return 0;               /* LK left it open */
++	}
++	for (int step = 0; step < 2; step++) {
++		uint32_t st = step ? ST_OPENED : ST_OPENING;
++		uint8_t open = st == ST_OPENED;
++		vr_set(c, 0, 1, open);
++		vr_set(c, 0, 2, open);
++		vr_set(c, 0, 3, open);
++		vr_set(c, 0, 0, st);
++		vr_set(c, 0, 7, 1);
++		vr_kick();
++		bool ok = false;
++		for (int t = 0; t < 200 && !ok; t++) {
++			uint32_t r = vr_get(c, 1, 0);
++			ok = step ? r == ST_OPENED : (r == ST_OPENING || r == ST_OPENED);
++			if (!ok) {
++				vince_smd_sleep(5);
++			}
++		}
++		if (!ok) {
++			return -1 - step;
++		}
++	}
++	vr_set(c, 1, 7, 0);
++	vr_set(c, 0, 10, vr_get(c, 0, 9));
++	vr_set(c, 1, 9, vr_get(c, 1, 10));
++	__asm__ volatile ("dsb osh" ::: "memory");
++	return 0;
++}
++
++/* one packet of len bytes (multiple of 4), 32-bit stores into the FIFO */
++static int
++vr_send(struct vr_ch *c, const uint32_t *w, uint32_t len)
++{
++	uint32_t head = vr_get(c, 0, 10), tail = vr_get(c, 0, 9), m = c->half - 1;
++	if (head >= c->half || tail >= c->half || (len & 3) || (c->half - 1) - ((head - tail) & m) < SMD_HDR + len) {
++		return -1;
++	}
++	uint32_t hdr[5] = { len, 0, 0, 0, 0 };
++	vr_set(c, 0, 6, 0);
++	for (int i = 0; i < 5; i++) {
++		wr32(c->fifo + head, hdr[i]);
++		head = (head + 4) & m;
++	}
++	for (uint32_t i = 0; i < len / 4; i++) {
++		wr32(c->fifo + head, w[i]);
++		head = (head + 4) & m;
++	}
++	__asm__ volatile ("dsb osh" ::: "memory");
++	vr_set(c, 0, 10, head);
++	vr_set(c, 0, 5, 1);
++	vr_kick();
++	return 0;
++}
++
++static int
++vr_recv(struct vr_ch *c, uint32_t *w, uint32_t maxw, unsigned ms)
++{
++	vm_offset_t rx = c->fifo + c->half;
++	uint32_t m = c->half - 1;
++	for (unsigned t = 0;; t += 5) {
++		uint32_t head = vr_get(c, 1, 10), tail = vr_get(c, 1, 9), avail = (head - tail) & m;
++		if (avail >= SMD_HDR) {
++			uint32_t len = rd32(rx + tail);
++			if (!len || len > 0x400 || (len & 3)) {
++				return -1;
++			}
++			if (avail >= SMD_HDR + len) {
++				tail = (tail + SMD_HDR) & m;
++				for (uint32_t i = 0; i < len / 4; i++) {
++					uint32_t v = rd32(rx + tail);
++					tail = (tail + 4) & m;
++					if (i < maxw) {
++						w[i] = v;
++					}
++				}
++				__asm__ volatile ("dsb osh" ::: "memory");
++				vr_set(c, 1, 9, tail);
++				vr_set(c, 1, 5, 0);
++				vr_set(c, 1, 6, 1);
++				vr_kick();
++				return (int)len;
++			}
++		}
++		if (t >= ms) {
++			return 0;
++		}
++		vince_smd_sleep(5);
++	}
++}
++
++/* active-set request: kvp = key, value pairs (4-byte values); 0 when RPM answers without an error */
++static int
++vr_request(struct vr_ch *c, uint32_t type, uint32_t id, const uint32_t *kv, uint32_t npairs, const char *what)
++{
++	static uint32_t msgid = 0x100;
++	uint32_t w[32], rsp[32];
++	uint32_t dlen = npairs * 12, n = 0;
++	w[n++] = RPM_REQ_SVC;
++	w[n++] = 20 + dlen;
++	w[n++] = ++msgid;
++	w[n++] = 0;             /* active set */
++	w[n++] = type;
++	w[n++] = id;
++	w[n++] = dlen;
++	for (uint32_t i = 0; i < npairs; i++) {
++		w[n++] = kv[2 * i];
++		w[n++] = 4;
++		w[n++] = kv[2 * i + 1];
++	}
++	if (vr_send(c, w, n * 4)) {
++		printf("VINCE RPM: %s: not sent\n", what);
++		return -1;
++	}
++	for (int k = 0; k < 4; k++) {
++		int r = vr_recv(c, rsp, 32, 500);
++		if (r <= 0) {
++			break;
++		}
++		uint32_t nw = MIN((uint32_t)r / 4, 32u), id_seen = 0;
++		bool err = false;
++		char es[33] = { 0 };
++		for (uint32_t i = 2; i + 2 <= nw;) {
++			uint32_t mt = rsp[i], ml = rsp[i + 1];
++			if (mt == RPM_MSG_ID && i + 2 < nw) {
++				id_seen = rsp[i + 2];
++			} else if (mt == RPM_MSG_ERR) {
++				err = true;
++				memcpy(es, &rsp[i + 2], MIN(ml, 32u) <= (nw - i - 2) * 4 ? MIN(ml, 32u) : 0);
++			}
++			i += 2 + (ml + 3) / 4;
++		}
++		if (id_seen == msgid) {
++			printf("VINCE RPM: %s: %s%s%s\n", what, err ? "error \"" : "ok", es, err ? "\"" : "");
++			return err ? -2 : 0;
++		}
++	}
++	printf("VINCE RPM: %s: no answer\n", what);
++	return -3;
++}
++
++/* PMIC LDO state through the SPMI observer (pm8953 SID 1, LDOn at 0x4000 + 0x100 * (n - 1)); read-only */
++static void
++vr_ldo_log(const char *when)
++{
++	static const int ldo[4] = { 5, 7, 9, 19 };
++	static vm_offset_t core, obs[4];
++	char line[160];
++	int pos = 0;
++
++	if (!core) {
++		core = ml_io_map(SPMI_CORE_PA, 0x1000);
++	}
++	pos += snprintf(line + pos, sizeof(line) - (size_t)pos, "VINCE RPM: LDOs %s:", when);
++	for (int k = 0; k < 4 && core; k++) {
++		uint32_t ppid = 0x100u | (0x40u + (uint32_t)ldo[k] - 1u);
++		if (!obs[k]) {
++			for (uint32_t apid = 0; apid < 256 && !obs[k]; apid++) {
++				uint32_t map = *(volatile uint32_t *)(core + 0x800u + 4u * apid);
++				if (map && ((map >> 8) & 0xfffu) == ppid) {
++					obs[k] = ml_io_map(SPMI_OBS_PA + 0x8000u * apid, 0x1000);
++				}
++			}
++		}
++		uint8_t v[2] = { 0xff, 0xff };
++		static const uint8_t regs[2] = { 0x08, 0x46 };     /* STATUS1 (bit 7 VREG_OK), EN_CTL (bit 7 enable) */
++		for (int r = 0; r < 2 && obs[k]; r++) {
++			*(volatile uint32_t *)(obs[k]) = (1u << 27) | ((uint32_t)regs[r] << 4);
++			for (int i = 0; i < 1000; i++) {
++				uint32_t st = *(volatile uint32_t *)(obs[k] + 0x08u);
++				if (st & 0x0eu) {
++					break;
++				}
++				if (st & 1u) {
++					v[r] = (uint8_t)*(volatile uint32_t *)(obs[k] + 0x18u);
++					break;
++				}
++				delay(1);
++			}
++		}
++		pos += snprintf(line + pos, sizeof(line) - (size_t)pos, " L%d %s(status %#x en %#x)", ldo[k],
++		    !obs[k] ? "unmapped" : (v[0] & 0x80) ? "ON " : "off ", v[0], v[1]);
++	}
++	printf("%s\n", line);
++}
++
++static void
++vince_iris_power(void)
++{
++	struct vr_ch c;
++	int r;
++
++	vr_ldo_log("before");
++	if (!vr_find(&c)) {
++		return;
++	}
++	if ((r = vr_open(&c)) != 0) {
++		printf("VINCE RPM: rpm_requests open failed %d (ours %u, RPM %u)\n", r, vr_get(&c, 0, 0), vr_get(&c, 1, 0));
++		return;
++	}
++	static const struct { uint32_t id, uv; const char *name; } l[4] = {
++		{ 5, 1800000, "L5 1.8 V (Iris dig)" }, { 7, 1800000, "L7 1.8 V (Iris XO)" },
++		{ 19, 1300000, "L19 1.3 V (Iris RF)" }, { 9, 3300000, "L9 3.3 V (Iris PA)" },
++	};
++	for (int i = 0; i < 4; i++) {
++		uint32_t kv[6] = { KVP_SWEN, 1, KVP_UV, l[i].uv, KVP_MA, 100 };
++		(void)vr_request(&c, RPM_LDOA, l[i].id, kv, 3, l[i].name);
++	}
++	/* RF clock buffers (rf_clk1 = id 4, rf_clk2 = id 5): Iris takes its XO from one of them */
++	for (uint32_t id = 4; id <= 5; id++) {
++		uint32_t kv[2] = { KVP_ENAB, 1 };
++		(void)vr_request(&c, RPM_CLKA, id, kv, 1, id == 4 ? "rf_clk1 on" : "rf_clk2 on");
++	}
++	vince_smd_sleep(10);
++	vr_ldo_log("after");
++}
++
+ static void
+ vince_pronto_boot(void)
+ {
+@@ -806,6 +1141,13 @@ vince_pronto_boot(void)
+ 	 * nothing at all starts it but HAL_START answers 38. An attempt whose WCNSS_CTRL does not show up within 5 s is
+ 	 * stopped (PAS SHUTDOWN) and the firmware reloaded for the next.
+ 	 */
++	{
++		int rpm = 1;
++		(void)PE_parse_boot_argn("vincerpm", &rpm, sizeof(rpm));
++		if (rpm) {
++			vince_iris_power();
++		}
++	}
+ 	static const int modes[] = { 2, 6, 1, 0 };
+ 	int only = -1, nmodes = (int)(sizeof(modes) / sizeof(modes[0]));
+ 	(void)PE_parse_boot_argn("vinceiris", &only, sizeof(only));
