@@ -1,0 +1,41 @@
+xnu: 0206 stand-in sandbox: grant the networking privileges
+
+On the phone, joined to a WPA2 hotspot: DNS answered and TLS to Apple worked,
+but Safari spun forever and never contacted the site. The stand-in sandbox
+denied privilege 10001 (PRIV_NET_PRIVILEGED_SOCKET_DELEGATE), which the WebKit
+networking process needs to open sockets for Safari; nsurlsessiond,
+mDNSResponder, trustd and geod were denied it too. Grant the PRIV_NET_* set
+iOS hands out through entitlements.
+
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 73afcef..cbbe7f9 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -329,6 +329,27 @@ sweet_sandbox_priv_grant(kauth_cred_t cred __unused, int priv)
+ 	if (priv == PRIV_WORK_INTERVAL) {
+ 		return 0;
+ 	}
++	/*
++	 * 0206: networking privileges iOS grants through entitlements. Without PRIV_NET_PRIVILEGED_SOCKET_DELEGATE the
++	 * WebKit networking process cannot open sockets on Safari's behalf: on the phone Safari spun forever on an
++	 * otherwise working Wi-Fi link (DNS, TLS to Apple fine) and never contacted the site; nsurlsessiond,
++	 * mDNSResponder, trustd and geod were denied 10001 too.
++	 */
++	switch (priv) {
++	case PRIV_NET_PRIVILEGED_TRAFFIC_CLASS:
++	case PRIV_NET_PRIVILEGED_SOCKET_DELEGATE:
++	case PRIV_NET_PRIVILEGED_NETWORK_STATISTICS:
++	case PRIV_NET_PRIVILEGED_NECP_POLICIES:
++	case PRIV_NET_PRIVILEGED_NECP_MATCH:
++	case PRIV_NET_QOSMARKING_POLICY_OVERRIDE:
++	case PRIV_NET_PRIVILEGED_CLIENT_ACCESS:
++	case PRIV_NET_PRIVILEGED_SERVER_ACCESS:
++	case PRIV_NET_VALIDATED_RESOLVER:
++	case PRIV_NET_CUSTOM_PROTOCOL:
++		return 0;
++	default:
++		break;
++	}
+ 	char name[20];
+ 	proc_selfname(name, sizeof(name));
+ 	for (int i = 0; i < sweet_priv_logged_count; i++) {
