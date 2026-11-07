@@ -1,0 +1,62 @@
+xnu: 0199 vince Pronto: 19.2 MHz Iris first, 30 s per WCNSS_CTRL step
+
+0198 on the phone: GPIO 76..80 were plain GPIOs (0x1), now 0x87. 48 MHz still
+never comes up (the Iris is a 19.2 MHz WCN3615-class part); at 19.2 MHz the
+firmware now created WCNSS_CTRL but did not answer the version request or
+the NV download within 4-6 s - it can reach the Iris now and calibrates
+first. Wait up to 30 s for each answer; try 19.2 MHz (then with the NV
+flag, then LK settings) and drop 48 MHz.
+
+diff --git a/bsd/dev/vince_smd.c b/bsd/dev/vince_smd.c
+index e07aebf..ff70b27 100644
+--- a/bsd/dev/vince_smd.c
++++ b/bsd/dev/vince_smd.c
+@@ -691,10 +691,11 @@ vp_ctrl(const uint8_t *nv, uint32_t nv_len)
+ 	}
+ 	uint32_t req[2] = { WC_VERSION_REQ, 8 };
+ 	vince_smd_send(&c, req, sizeof(req));
+-	for (int k = 0; k < 4; k++) {
++	/* with the Iris reachable (0198 pins) the firmware may calibrate before answering: up to 30 s per step */
++	for (int k = 0; k < 30; k++) {
+ 		r = vince_smd_recv(&c, rsp, sizeof(rsp), 1000);
+ 		if (r >= 12 && rsp[0] == (uint8_t)WC_VERSION_RSP && rsp[3] == 0x01) {
+-			printf("VINCE PRONTO: WCNSS version %u.%u.%u.%u\n", rsp[8], rsp[9], rsp[10], rsp[11]);
++			printf("VINCE PRONTO: WCNSS version %u.%u.%u.%u (after %d s)\n", rsp[8], rsp[9], rsp[10], rsp[11], k + 1);
+ 			break;
+ 		}
+ 		if (r > 0) {
+@@ -729,13 +730,13 @@ vp_ctrl(const uint8_t *nv, uint32_t nv_len)
+ 		left -= n;
+ 		seq++;
+ 	}
+-	for (int k = 0; k < 6; k++) {
++	for (int k = 0; k < 30; k++) {
+ 		r = vince_smd_recv(&c, rsp, sizeof(rsp), 1000);
+ 		if (r >= 9 && rsp[0] == (uint8_t)WC_NV_RSP && rsp[3] == 0x01) {
+-			printf("VINCE PRONTO: NV download (%u fragments) answered, status %u\n", seq, rsp[8]);
++			printf("VINCE PRONTO: NV download (%u fragments) answered after %d s, status %u\n", seq, k + 1, rsp[8]);
+ 			if (rsp[8] == 2) {
+ 				/* WCNSS_ACK_COLD_BOOTING: cold boot calibration runs; wait for CBC_COMPLETE_IND as wcnss_ctrl.c */
+-				for (int t = 0; t < 15; t++) {
++				for (int t = 0; t < 30; t++) {
+ 					r = vince_smd_recv(&c, rsp, sizeof(rsp), 1000);
+ 					if (r >= 8 && rsp[0] == 0x0c && rsp[3] == 0x01) {
+ 						printf("VINCE PRONTO: cold boot calibration complete after %d s\n", t + 1);
+@@ -746,7 +747,7 @@ vp_ctrl(const uint8_t *nv, uint32_t nv_len)
+ 						    rsp[0] | rsp[1] << 8 | rsp[2] << 16 | (uint32_t)rsp[3] << 24, r);
+ 					}
+ 				}
+-				printf("VINCE PRONTO: no calibration-complete message within 15 s\n");
++				printf("VINCE PRONTO: no calibration-complete message within 30 s\n");
+ 			}
+ 			return 0;
+ 		}
+@@ -1235,7 +1236,7 @@ vince_pronto_boot(void)
+ 			vp_wcss_pins();
+ 		}
+ 	}
+-	static const int modes[] = { 3, 2, 6, 0 };
++	static const int modes[] = { 6, 7, 0 };
+ 	int only = -1, nmodes = (int)(sizeof(modes) / sizeof(modes[0]));
+ 	(void)PE_parse_boot_argn("vinceiris", &only, sizeof(only));
+ 	for (int m = 0; m < nmodes; m++) {
