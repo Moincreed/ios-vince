@@ -1,0 +1,377 @@
+xnu: 0189 vince Pronto (WCNSS) start in the kernel
+
+boot-arg vincepronto=1: load the Wi-Fi firmware packed behind the boot image
+(tools/mkwcnss_blob.py) into wcnss_fw_region, start it through TrustZone PAS
+(INIT_IMAGE, MEM_SETUP, AUTH_AND_RESET, pas-id 6), then the WCNSS_CTRL version
+request and NV download - what the private vince-bringup shim did.
+
+diff --git a/bsd/dev/vince_mmc.c b/bsd/dev/vince_mmc.c
+index d01f787..1cc102a 100644
+--- a/bsd/dev/vince_mmc.c
++++ b/bsd/dev/vince_mmc.c
+@@ -1065,6 +1065,39 @@ vince_mgreset_start(void)
+ 	}
+ }
+ 
++/*
++ * Read n sectors at partition-relative sector rel of GPT partition name into dst (normal kernel memory).
++ * For vince_smd.c (Pronto firmware kept in the unused tail of "boot"). Read-only; vm.first / vm.nsect are kept.
++ */
++int vince_mmc_part_read(const char *name, uint64_t rel, uint32_t n, void *dst);
++
++int
++vince_mmc_part_read(const char *name, uint64_t rel, uint32_t n, void *dst)
++{
++	if (!vm.ready) {
++		return ENXIO;
++	}
++	lck_mtx_lock(&vince_mmc_lock);
++	uint64_t first = vm.first, nsect = vm.nsect;
++	int error = mmc_find_partition(name);
++	uint64_t pfirst = vm.first, pn = vm.nsect;
++	vm.first = first;
++	vm.nsect = nsect;
++	if (!error && (rel >= pn || n > pn - rel)) {
++		error = EINVAL;
++	}
++	for (uint32_t done = 0; !error && done < n;) {
++		uint32_t k = MIN(n - done, MAX_SECTORS);
++		error = mmc_read_sectors(pfirst + rel + done, k);
++		if (!error) {
++			memcpy((uint8_t *)dst + (uint64_t)done * SECTOR, vince_mmc_bounce, (size_t)k * SECTOR);
++		}
++		done += k;
++	}
++	lck_mtx_unlock(&vince_mmc_lock);
++	return error;
++}
++
+ /* Root device for rd=mmcroot0, and the mmcprobe=1 check (IOFindBSDRoot). */
+ int vince_mmc_rootdev(dev_t *dev);
+ 
+diff --git a/bsd/dev/vince_smd.c b/bsd/dev/vince_smd.c
+index 1653ade..1399cba 100644
+--- a/bsd/dev/vince_smd.c
++++ b/bsd/dev/vince_smd.c
+@@ -25,6 +25,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <kern/kalloc.h>
+ #include "vince_smd.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -455,6 +456,295 @@ vince_smd_map(void)
+ 	return smem && apcs;
+ }
+ 
++/*
++ * ---- Pronto start (boot-arg vincepronto=1), what the private vince-bringup shim did (pas_autostart) ----
++ *
++ * The firmware (modem partition IMAGE/WCNSS.MDT + .Bnn) and the phone's calibration (persist
++ * WCNSS_qcom_wlan_nv.bin) are packed by tools/mkwcnss_blob.py and written behind the boot image, at
++ * VP_BLOB_SECT of the "boot" partition. Here: copy the segments into wcnss_fw_region (0x8E800000, 7 MiB, the
++ * firmware relocated there from its link address 0x8E600000, as Linux PIL does), hand the headers to TrustZone
++ * (PAS INIT_IMAGE, MEM_SETUP, AUTH_AND_RESET, pas-id 6), wait for WCNSS_CTRL, ask the version, download the NV.
++ * SCM over SMCCC (SIP owner, svc 2 = PIL, svc 6 = INFO), as mainline qcom_scm-smc.c. Every step is logged.
++ */
++extern int vince_mmc_part_read(const char *name, uint64_t rel, uint32_t n, void *dst);
++
++#define VP_BLOB_SECT    (40u * 2048u)          /* 40 MiB into "boot" */
++#define VP_FW_PA        0x8E800000u
++#define VP_FW_MAX       0x00700000u
++#define VP_META_OFF     0x006C0000u             /* metadata copy, inside the reserved region, behind the firmware */
++#define VP_PAS_ID       6u
++#define VP_MAX_CHUNKS   32u
++#define GCC_VOTE_PA     0x01845004u             /* GCC_APCS_CLOCK_BRANCH_ENA_VOTE: crypto ahb/axi/core = bits 0..2 */
++
++struct vp_hdr {
++	char magic[8];                          /* "VWCNSS01" */
++	uint32_t mdt_sect, mdt_len;             /* sectors from the blob start, bytes */
++	uint32_t nv_sect, nv_len;
++	uint32_t fw_span;                       /* bytes from VP_FW_PA the segments cover */
++	uint32_t nchunks;
++	struct {
++		uint32_t sect, len, dst, memsz;         /* data at sect (from the blob start), len bytes, to VP_FW_PA + dst */
++	} c[VP_MAX_CHUNKS];
++};
++
++static bool vp_smc64 = true;
++
++static uint64_t
++vp_smc(uint64_t fn, uint64_t arginfo, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t *res1)
++{
++	uint64_t session = 0, x0 = fn;
++
++	for (int retry = 0;; retry++) {
++		register uint64_t r0 __asm__("x0") = x0;
++		register uint64_t r1 __asm__("x1") = arginfo;
++		register uint64_t r2 __asm__("x2") = a0;
++		register uint64_t r3 __asm__("x3") = a1;
++		register uint64_t r4 __asm__("x4") = a2;
++		register uint64_t r5 __asm__("x5") = 0;
++		register uint64_t r6 __asm__("x6") = session;
++		__asm__ volatile ("smc #0"
++                    : "+r" (r0), "+r" (r1), "+r" (r2), "+r" (r3), "+r" (r4), "+r" (r5), "+r" (r6)
++                    :
++                    : "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++		if (r0 == 1) {                  /* QCOM_SCM_INTERRUPTED: resume the same call */
++			x0 = 1;
++			session = r6;
++			continue;
++		}
++		if ((int64_t)r0 == -12 && retry < 20) {  /* QCOM_SCM_V2_EBUSY */
++			vince_smd_sleep(30);
++			x0 = fn;
++			continue;
++		}
++		if (res1) {
++			*res1 = r1;
++		}
++		return r0;
++	}
++}
++
++static uint64_t
++vp_fn(uint32_t svc, uint32_t cmd)
++{
++	return (vp_smc64 ? 0x42000000ull : 0x02000000ull) | (svc << 8) | cmd;
++}
++
++/* SCM call; x0 status (0 ok) in the return, x1 in *res */
++static int64_t
++vp_scm(uint32_t svc, uint32_t cmd, uint64_t arginfo, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t *res)
++{
++	return (int64_t)vp_smc(vp_fn(svc, cmd), arginfo, a0, a1, a2, res);
++}
++
++static void
++vp_wr(vm_offset_t dst, const uint8_t *src, uint32_t len)
++{
++	uint32_t i = 0;
++	for (; i + 4 <= len; i += 4) {
++		uint32_t w;
++		memcpy(&w, src + i, 4);
++		*(volatile uint32_t *)(dst + i) = w;
++	}
++	if (i < len) {
++		uint32_t w = 0;
++		memcpy(&w, src + i, len - i);
++		*(volatile uint32_t *)(dst + i) = w;
++	}
++}
++
++static void
++vp_zero(vm_offset_t dst, uint32_t len)
++{
++	for (uint32_t i = 0; i < len; i += 4) {
++		*(volatile uint32_t *)(dst + i) = 0;
++	}
++}
++
++/* WCNSS_CTRL (wcnss_ctrl.c / downstream wcnss_wlan.c): { u32 type, u32 len } headers */
++#define WC_VERSION_REQ  0x01000000u
++#define WC_VERSION_RSP  0x01000001u
++#define WC_NV_REQ       0x01000002u
++#define WC_NV_RSP       0x01000003u
++#define WC_NV_FRAG      3072u
++
++static int
++vp_ctrl(const uint8_t *nv, uint32_t nv_len)
++{
++	struct vsmd_ch c;
++	static uint8_t msg[16 + WC_NV_FRAG], rsp[256];
++	int r = -1;
++
++	for (int i = 0; i < 200 && !vince_smd_find("WCNSS_CTRL", &c); i++) {
++		vince_smd_sleep(25);
++	}
++	if (!vince_smd_find("WCNSS_CTRL", &c)) {
++		printf("VINCE PRONTO: no WCNSS_CTRL channel within 5 s\n");
++		return -1;
++	}
++	for (int i = 0; i < 100 && (r = vince_smd_open(&c)) == -1; i++) {
++		vince_smd_sleep(20);
++	}
++	if (r) {
++		printf("VINCE PRONTO: WCNSS_CTRL open failed %d\n", r);
++		return -2;
++	}
++	uint32_t req[2] = { WC_VERSION_REQ, 8 };
++	vince_smd_send(&c, req, sizeof(req));
++	for (int k = 0; k < 4; k++) {
++		r = vince_smd_recv(&c, rsp, sizeof(rsp), 1000);
++		if (r >= 12 && rsp[0] == (uint8_t)WC_VERSION_RSP && rsp[3] == 0x01) {
++			printf("VINCE PRONTO: WCNSS version %u.%u.%u.%u\n", rsp[8], rsp[9], rsp[10], rsp[11]);
++			break;
++		}
++		if (r > 0) {
++			printf("VINCE PRONTO: WCNSS_CTRL message type %#x len %d\n",
++			    rsp[0] | rsp[1] << 8 | rsp[2] << 16 | (uint32_t)rsp[3] << 24, r);
++		}
++	}
++	/* NV: the first 4 bytes are a validity bitmap (downstream skips them) */
++	if (nv_len <= 4) {
++		printf("VINCE PRONTO: no NV, not downloaded\n");
++		return 0;
++	}
++	const uint8_t *d = nv + 4;
++	uint32_t left = nv_len - 4;
++	uint16_t seq = 0;
++	while (left > 0) {
++		uint32_t n = MIN(left, WC_NV_FRAG);
++		uint32_t h[2] = { WC_NV_REQ, 16 + n };
++		uint16_t s2[2] = { seq, (uint16_t)(left <= WC_NV_FRAG) };
++		memcpy(msg, h, 8);
++		memcpy(msg + 8, s2, 4);
++		memcpy(msg + 12, &n, 4);
++		memcpy(msg + 16, d, n);
++		for (int t = 0; (r = vince_smd_send(&c, msg, 16 + n)) == -2 && t < 200; t++) {
++			vince_smd_sleep(5);
++		}
++		if (r) {
++			printf("VINCE PRONTO: NV fragment %u not sent %d\n", seq, r);
++			return -3;
++		}
++		d += n;
++		left -= n;
++		seq++;
++	}
++	for (int k = 0; k < 6; k++) {
++		r = vince_smd_recv(&c, rsp, sizeof(rsp), 1000);
++		if (r >= 9 && rsp[0] == (uint8_t)WC_NV_RSP && rsp[3] == 0x01) {
++			printf("VINCE PRONTO: NV download (%u fragments) answered, status %u\n", seq, rsp[8]);
++			return 0;
++		}
++		if (r > 0) {
++			printf("VINCE PRONTO: WCNSS_CTRL message type %#x len %d\n",
++			    rsp[0] | rsp[1] << 8 | rsp[2] << 16 | (uint32_t)rsp[3] << 24, r);
++		}
++	}
++	printf("VINCE PRONTO: no NV download answer (%u fragments sent)\n", seq);
++	return 0;
++}
++
++static void
++vince_pronto_boot(void)
++{
++	static struct vp_hdr h;
++	uint8_t *buf = NULL, *mdt = NULL, *nv = NULL;
++	const uint32_t bufsz = 64 * 1024;
++	uint64_t res = 0;
++	int64_t st;
++	int error;
++
++	static uint8_t hbuf[1024];
++	_Static_assert(sizeof(h) <= sizeof(hbuf), "blob header");
++	if ((error = vince_mmc_part_read("boot", VP_BLOB_SECT, 2, hbuf)) != 0) {
++		printf("VINCE PRONTO: blob header unreadable (%d)\n", error);
++		return;
++	}
++	memcpy(&h, hbuf, sizeof(h));
++	if (memcmp(h.magic, "VWCNSS01", 8) != 0 || h.nchunks > VP_MAX_CHUNKS || h.fw_span > VP_META_OFF ||
++	    h.mdt_len == 0 || h.mdt_len > 0x10000 || h.nv_len > 0x20000) {
++		printf("VINCE PRONTO: no firmware blob at boot+40 MiB (flash the boot image with the Wi-Fi blob)\n");
++		return;
++	}
++	vm_offset_t fw = ml_io_map(VP_FW_PA, VP_FW_MAX), vote = ml_io_map(GCC_VOTE_PA & ~0xfffu, 0x1000);
++	buf = kalloc_data(bufsz, Z_WAITOK);
++	mdt = kalloc_data((h.mdt_len + 511) & ~511u, Z_WAITOK);
++	nv = kalloc_data(((h.nv_len + 511) & ~511u) + 512, Z_WAITOK);
++	if (!fw || !vote || !buf || !mdt || !nv) {
++		printf("VINCE PRONTO: mapping or allocation failed\n");
++		goto out;
++	}
++	if (vince_mmc_part_read("boot", VP_BLOB_SECT + h.mdt_sect, (h.mdt_len + 511) / 512, mdt) ||
++	    (h.nv_len && vince_mmc_part_read("boot", VP_BLOB_SECT + h.nv_sect, (h.nv_len + 511) / 512, nv))) {
++		printf("VINCE PRONTO: blob read failed\n");
++		goto out;
++	}
++	/* firmware segments into the reserved region (device memory: 32-bit stores) */
++	vp_zero(fw, (h.fw_span + 3) & ~3u);
++	for (uint32_t i = 0; i < h.nchunks; i++) {
++		uint32_t sect = h.c[i].sect, left = h.c[i].len, dst = h.c[i].dst;
++		if (dst + h.c[i].memsz > h.fw_span || left > h.c[i].memsz) {
++			printf("VINCE PRONTO: chunk %u out of range\n", i);
++			goto out;
++		}
++		while (left > 0) {
++			uint32_t n = MIN(left, bufsz);
++			if (vince_mmc_part_read("boot", VP_BLOB_SECT + sect, (n + 511) / 512, buf)) {
++				printf("VINCE PRONTO: chunk %u read failed\n", i);
++				goto out;
++			}
++			vp_wr(fw + dst, buf, n);
++			sect += n / 512;
++			dst += n;
++			left -= n;
++		}
++	}
++	vp_wr(fw + VP_META_OFF, mdt, h.mdt_len);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	printf("VINCE PRONTO: firmware in place: %u segments, %u KiB at %#x, metadata %u bytes, NV %u bytes\n",
++	    h.nchunks, h.fw_span >> 10, VP_FW_PA, h.mdt_len, h.nv_len);
++
++	/* crypto engine clocks for the signature check (votes; LK may have them on already) */
++	*(volatile uint32_t *)(vote + (GCC_VOTE_PA & 0xfffu)) |= 7u;
++	__asm__ volatile ("dsb sy" ::: "memory");
++
++	/* SMC calling convention: 64-bit if TrustZone answers INFO is-call-available that way */
++	st = vp_scm(6, 1, 1, 0x02000000u | (6u << 8) | 1u, 0, 0, &res);
++	if (st != 0) {
++		vp_smc64 = false;
++		st = vp_scm(6, 1, 1, 0x02000000u | (6u << 8) | 1u, 0, 0, &res);
++	}
++	printf("VINCE PRONTO: SCM %s convention (info %lld/%llu)\n", vp_smc64 ? "SMC64" : "SMC32", st, res);
++	st = vp_scm(2, 7, 1, VP_PAS_ID, 0, 0, &res);            /* PAS_IS_SUPPORTED */
++	printf("VINCE PRONTO: PAS supported for pas-id %u: status %lld result %llu\n", VP_PAS_ID, st, res);
++	st = vp_scm(2, 1, 0x82, VP_PAS_ID, VP_FW_PA + VP_META_OFF, 0, &res);    /* INIT_IMAGE (val, rw buffer) */
++	printf("VINCE PRONTO: INIT_IMAGE status %lld result %llu\n", st, res);
++	if (st || res) {
++		goto out;
++	}
++	st = vp_scm(2, 2, 3, VP_PAS_ID, VP_FW_PA, (h.fw_span + 0xfff) & ~0xfffu, &res);     /* MEM_SETUP */
++	printf("VINCE PRONTO: MEM_SETUP status %lld result %llu\n", st, res);
++	if (st || res) {
++		goto out;
++	}
++	st = vp_scm(2, 5, 1, VP_PAS_ID, 0, 0, &res);            /* AUTH_AND_RESET */
++	printf("VINCE PRONTO: AUTH_AND_RESET status %lld result %llu\n", st, res);
++	if (st || res) {
++		goto out;
++	}
++	printf("VINCE PRONTO: Pronto started\n");
++	(void)vp_ctrl(nv, h.nv_len);
++out:
++	if (buf) {
++		kfree_data(buf, bufsz);
++	}
++	if (mdt) {
++		kfree_data(mdt, (h.mdt_len + 511) & ~511u);
++	}
++	if (nv) {
++		kfree_data(nv, ((h.nv_len + 511) & ~511u) + 512);
++	}
++}
++
+ void
+ vince_smd_start(void)
+ {
+@@ -465,6 +755,17 @@ vince_smd_start(void)
+ 		return;
+ 	}
+ 	smd_started = true;
++	{
++		int pronto = 0;
++		(void)PE_parse_boot_argn("vincepronto", &pronto, sizeof(pronto));
++		if (pronto) {
++			if (vince_smd_map()) {
++				vince_pronto_boot();
++			} else {
++				printf("VINCE PRONTO: SMEM mapping failed\n");
++			}
++		}
++	}
+ 	(void)PE_parse_boot_argn("vincesmd", &on, sizeof(on));
+ 	if (on) {
+ 		if (!vince_smd_map()) {
