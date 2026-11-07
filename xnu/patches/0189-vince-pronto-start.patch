@@ -1,9 +1,10 @@
 xnu: 0189 vince Pronto (WCNSS) start in the kernel
 
 boot-arg vincepronto=1: load the Wi-Fi firmware packed behind the boot image
-(tools/mkwcnss_blob.py) into wcnss_fw_region, start it through TrustZone PAS
-(INIT_IMAGE, MEM_SETUP, AUTH_AND_RESET, pas-id 6), then the WCNSS_CTRL version
-request and NV download - what the private vince-bringup shim did.
+(tools/mkwcnss_blob.py) into wcnss_fw_region through 64 KiB device windows,
+start it through TrustZone PAS (INIT_IMAGE, MEM_SETUP, AUTH_AND_RESET,
+pas-id 6), then the WCNSS_CTRL version request and NV download - what the
+private vince-bringup shim did.
 
 diff --git a/bsd/dev/vince_mmc.c b/bsd/dev/vince_mmc.c
 index d01f787..1cc102a 100644
@@ -50,10 +51,10 @@ index d01f787..1cc102a 100644
  int vince_mmc_rootdev(dev_t *dev);
  
 diff --git a/bsd/dev/vince_smd.c b/bsd/dev/vince_smd.c
-index 1653ade..1399cba 100644
+index 1653ade..a2a5cd5 100644
 --- a/bsd/dev/vince_smd.c
 +++ b/bsd/dev/vince_smd.c
-@@ -25,6 +25,7 @@
+@@ -25,9 +25,11 @@
  #include <kern/sched_prim.h>
  #include <machine/machine_routines.h>
  #include <pexpert/pexpert.h>
@@ -61,7 +62,11 @@ index 1653ade..1399cba 100644
  #include "vince_smd.h"
  
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
-@@ -455,6 +456,295 @@ vince_smd_map(void)
++extern void ml_io_unmap(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+ void vince_smd_start(void);
+ extern void vince_wlan_start(void);
+@@ -455,6 +457,320 @@ vince_smd_map(void)
  	return smem && apcs;
  }
  
@@ -145,28 +150,45 @@ index 1653ade..1399cba 100644
 +	return (int64_t)vp_smc(vp_fn(svc, cmd), arginfo, a0, a1, a2, res);
 +}
 +
-+static void
-+vp_wr(vm_offset_t dst, const uint8_t *src, uint32_t len)
-+{
-+	uint32_t i = 0;
-+	for (; i + 4 <= len; i += 4) {
-+		uint32_t w;
-+		memcpy(&w, src + i, 4);
-+		*(volatile uint32_t *)(dst + i) = w;
-+	}
-+	if (i < len) {
-+		uint32_t w = 0;
-+		memcpy(&w, src + i, len - i);
-+		*(volatile uint32_t *)(dst + i) = w;
-+	}
-+}
++/*
++ * Physical writes into wcnss_fw_region through 64 KiB device mappings, one at a time: one 7 MiB ml_io_map panics
++ * (kmem_alloc of the whole size fails, seen on the phone). src NULL = zero fill. 32-bit stores only.
++ */
++#define VP_WIN          0x10000u
 +
-+static void
-+vp_zero(vm_offset_t dst, uint32_t len)
++static int
++vp_phys(uint32_t pa, const uint8_t *src, uint32_t len)
 +{
-+	for (uint32_t i = 0; i < len; i += 4) {
-+		*(volatile uint32_t *)(dst + i) = 0;
++	while (len > 0) {
++		uint32_t base = pa & ~(VP_WIN - 1), off = pa - base, n = MIN(len, VP_WIN - off);
++		vm_offset_t w = ml_io_map(base, VP_WIN);
++		if (!w) {
++			return -1;
++		}
++		uint32_t i = 0;
++		for (; i + 4 <= n; i += 4) {
++			uint32_t v = 0;
++			if (src) {
++				memcpy(&v, src + i, 4);
++			}
++			*(volatile uint32_t *)(w + off + i) = v;
++		}
++		if (i < n) {
++			uint32_t v = 0;
++			if (src) {
++				memcpy(&v, src + i, n - i);
++			}
++			*(volatile uint32_t *)(w + off + i) = v;
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		ml_io_unmap(w, VP_WIN);
++		pa += n;
++		len -= n;
++		if (src) {
++			src += n;
++		}
 +	}
++	return 0;
 +}
 +
 +/* WCNSS_CTRL (wcnss_ctrl.c / downstream wcnss_wlan.c): { u32 type, u32 len } headers */
@@ -274,11 +296,11 @@ index 1653ade..1399cba 100644
 +		printf("VINCE PRONTO: no firmware blob at boot+40 MiB (flash the boot image with the Wi-Fi blob)\n");
 +		return;
 +	}
-+	vm_offset_t fw = ml_io_map(VP_FW_PA, VP_FW_MAX), vote = ml_io_map(GCC_VOTE_PA & ~0xfffu, 0x1000);
++	vm_offset_t vote = ml_io_map(GCC_VOTE_PA & ~0xfffu, 0x1000);
 +	buf = kalloc_data(bufsz, Z_WAITOK);
 +	mdt = kalloc_data((h.mdt_len + 511) & ~511u, Z_WAITOK);
 +	nv = kalloc_data(((h.nv_len + 511) & ~511u) + 512, Z_WAITOK);
-+	if (!fw || !vote || !buf || !mdt || !nv) {
++	if (!vote || !buf || !mdt || !nv) {
 +		printf("VINCE PRONTO: mapping or allocation failed\n");
 +		goto out;
 +	}
@@ -288,7 +310,10 @@ index 1653ade..1399cba 100644
 +		goto out;
 +	}
 +	/* firmware segments into the reserved region (device memory: 32-bit stores) */
-+	vp_zero(fw, (h.fw_span + 3) & ~3u);
++	if (vp_phys(VP_FW_PA, NULL, (h.fw_span + 3) & ~3u)) {
++		printf("VINCE PRONTO: firmware region mapping failed\n");
++		goto out;
++	}
 +	for (uint32_t i = 0; i < h.nchunks; i++) {
 +		uint32_t sect = h.c[i].sect, left = h.c[i].len, dst = h.c[i].dst;
 +		if (dst + h.c[i].memsz > h.fw_span || left > h.c[i].memsz) {
@@ -301,13 +326,18 @@ index 1653ade..1399cba 100644
 +				printf("VINCE PRONTO: chunk %u read failed\n", i);
 +				goto out;
 +			}
-+			vp_wr(fw + dst, buf, n);
++			if (vp_phys(VP_FW_PA + dst, buf, n)) {
++				printf("VINCE PRONTO: firmware region mapping failed\n");
++				goto out;
++			}
 +			sect += n / 512;
 +			dst += n;
 +			left -= n;
 +		}
 +	}
-+	vp_wr(fw + VP_META_OFF, mdt, h.mdt_len);
++	if (vp_phys(VP_FW_PA + VP_META_OFF, mdt, h.mdt_len)) {
++		goto out;
++	}
 +	__asm__ volatile ("dsb sy" ::: "memory");
 +	printf("VINCE PRONTO: firmware in place: %u segments, %u KiB at %#x, metadata %u bytes, NV %u bytes\n",
 +	    h.nchunks, h.fw_span >> 10, VP_FW_PA, h.mdt_len, h.nv_len);
@@ -357,7 +387,7 @@ index 1653ade..1399cba 100644
  void
  vince_smd_start(void)
  {
-@@ -465,6 +755,17 @@ vince_smd_start(void)
+@@ -465,6 +781,17 @@ vince_smd_start(void)
  		return;
  	}
  	smd_started = true;
