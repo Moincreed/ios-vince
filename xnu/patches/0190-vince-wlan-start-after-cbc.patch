@@ -1,0 +1,50 @@
+xnu: 0190 vince Wi-Fi: wait for cold boot calibration, retry HAL_START
+
+On the phone (0189): NV download answered status 2 (cold booting) and the
+WLAN thread HAL_START right after got status 38. Wait for CBC_COMPLETE_IND
+(up to 15 s) after a cold-booting NV answer, and retry HAL_START 5 x 3 s.
+
+diff --git a/bsd/dev/vince_smd.c b/bsd/dev/vince_smd.c
+index 48ddead..947af3e 100644
+--- a/bsd/dev/vince_smd.c
++++ b/bsd/dev/vince_smd.c
+@@ -640,6 +640,21 @@ vp_ctrl(const uint8_t *nv, uint32_t nv_len)
+ 		r = vince_smd_recv(&c, rsp, sizeof(rsp), 1000);
+ 		if (r >= 9 && rsp[0] == (uint8_t)WC_NV_RSP && rsp[3] == 0x01) {
+ 			printf("VINCE PRONTO: NV download (%u fragments) answered, status %u\n", seq, rsp[8]);
++			if (rsp[8] == 2) {
++				/* WCNSS_ACK_COLD_BOOTING: cold boot calibration runs; wait for CBC_COMPLETE_IND as wcnss_ctrl.c */
++				for (int t = 0; t < 15; t++) {
++					r = vince_smd_recv(&c, rsp, sizeof(rsp), 1000);
++					if (r >= 8 && rsp[0] == 0x0c && rsp[3] == 0x01) {
++						printf("VINCE PRONTO: cold boot calibration complete after %d s\n", t + 1);
++						return 0;
++					}
++					if (r > 0) {
++						printf("VINCE PRONTO: WCNSS_CTRL message type %#x len %d\n",
++						    rsp[0] | rsp[1] << 8 | rsp[2] << 16 | (uint32_t)rsp[3] << 24, r);
++					}
++				}
++				printf("VINCE PRONTO: no calibration-complete message within 15 s\n");
++			}
+ 			return 0;
+ 		}
+ 		if (r > 0) {
+diff --git a/bsd/dev/vince_wlan.c b/bsd/dev/vince_wlan.c
+index 74616ca..4a60973 100755
+--- a/bsd/dev/vince_wlan.c
++++ b/bsd/dev/vince_wlan.c
+@@ -696,7 +696,12 @@ vw_bringup(int stage)
+ 		/* mainline sets the tx-rings-empty SMSM bit before it starts the chip */
+ 		printf("VINCE WLAN: SMSM tx-rings-empty %d\n", vd_smsm_rings_empty());
+ 	}
+-	if (vw_start() || vw_caps()) {
++	/* the firmware can refuse HAL_START (status 38 seen) right after the NV download; retry a few times */
++	for (int i = 0; (r = vw_start()) == -7 && i < 5; i++) {
++		printf("VINCE WLAN: HAL_START refused, retrying in 3 s\n");
++		vince_smd_sleep(3000);
++	}
++	if (r || vw_caps()) {
+ 		return -3;
+ 	}
+ 	vw_crash_baseline();
