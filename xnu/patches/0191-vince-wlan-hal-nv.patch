@@ -1,0 +1,100 @@
+xnu: 0191 vince Wi-Fi: NV download over the WLAN HAL before HAL_START
+
+Mainline wcn36xx sends the NV again as WCN36XX_HAL_DOWNLOAD_NV_REQ (55) in
+3072-byte fragments before HAL_START; without it HAL_START answered status
+38 on every try (phone log with 0190). 0189 keeps the NV for this.
+
+diff --git a/bsd/dev/vince_smd.c b/bsd/dev/vince_smd.c
+index 947af3e..1bf21dc 100644
+--- a/bsd/dev/vince_smd.c
++++ b/bsd/dev/vince_smd.c
+@@ -488,6 +488,9 @@ struct vp_hdr {
+ };
+ 
+ static bool vp_smc64 = true;
++/* the NV, kept for vince_wlan.c: the WLAN HAL wants it again (DOWNLOAD_NV_REQ) before HAL_START */
++const uint8_t *vince_pronto_nv;
++uint32_t vince_pronto_nv_len;
+ 
+ static uint64_t
+ vp_smc(uint64_t fn, uint64_t arginfo, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t *res1)
+@@ -764,6 +767,11 @@ vince_pronto_boot(void)
+ 	}
+ 	printf("VINCE PRONTO: Pronto started\n");
+ 	(void)vp_ctrl(nv, h.nv_len);
++	if (h.nv_len > 4) {
++		vince_pronto_nv = nv;           /* kept (not freed below) */
++		vince_pronto_nv_len = h.nv_len;
++		nv = NULL;
++	}
+ out:
+ 	if (buf) {
+ 		kfree_data(buf, bufsz);
+diff --git a/bsd/dev/vince_wlan.c b/bsd/dev/vince_wlan.c
+index 4a60973..9e28865 100755
+--- a/bsd/dev/vince_wlan.c
++++ b/bsd/dev/vince_wlan.c
+@@ -182,6 +182,51 @@ vw_log_name(const char *what, const uint8_t *s)
+ 	printf("VINCE WLAN: %s \"%s\"\n", what, t);
+ }
+ 
++/*
++ * WCN36XX_HAL_DOWNLOAD_NV_REQ (55): the NV again, over WLAN_CTRL, before HAL_START (mainline wcn36xx_smd_load_nv):
++ * without it HAL_START answers status 38 (seen on the phone). The file's first 4 bytes (validity bitmap) are
++ * skipped; 3072-byte fragments, each answered by DOWNLOAD_NV_RSP (56) with a u32 status.
++ */
++extern const uint8_t *vince_pronto_nv;
++extern uint32_t vince_pronto_nv_len;
++#define HAL_DOWNLOAD_NV_REQ     55
++#define HAL_DOWNLOAD_NV_RSP     56
++#define HAL_NV_FRAG             3072u
++
++static int
++vw_load_nv(void)
++{
++	if (!vince_pronto_nv || vince_pronto_nv_len <= 4) {
++		printf("VINCE WLAN: no NV to download (vincepronto=1 keeps it)\n");
++		return -1;
++	}
++	const uint8_t *d = vince_pronto_nv + 4;
++	uint32_t size = vince_pronto_nv_len - 4, off = 0;
++	uint16_t frag = 0;
++	while (off < size) {
++		uint32_t n = MIN(size - off, HAL_NV_FRAG);
++		vw_hdr(vw_req, HAL_DOWNLOAD_NV_REQ, 16 + n);
++		vw_put16(vw_req + 8, frag);
++		vw_put16(vw_req + 10, off + n >= size);
++		vw_put32(vw_req + 12, n);
++		memcpy(vw_req + 16, d + off, n);
++		int r = vw_xfer(16 + n, HAL_DOWNLOAD_NV_RSP);
++		if (r < 12) {
++			printf("VINCE WLAN: DOWNLOAD_NV fragment %u failed %d\n", frag, r);
++			return -2;
++		}
++		uint32_t st = vw_rsp[8] | vw_rsp[9] << 8 | vw_rsp[10] << 16 | (uint32_t)vw_rsp[11] << 24;
++		if (st != 0) {
++			printf("VINCE WLAN: DOWNLOAD_NV fragment %u status %u\n", frag, st);
++			return -3;
++		}
++		off += n;
++		frag++;
++	}
++	printf("VINCE WLAN: NV downloaded to the WLAN HAL (%u fragments, %u bytes)\n", frag, size);
++	return 0;
++}
++
+ /* HAL_START_REQ with the stock config table; 0 when the firmware answers status 0 */
+ static int
+ vw_start(void)
+@@ -696,8 +741,9 @@ vw_bringup(int stage)
+ 		/* mainline sets the tx-rings-empty SMSM bit before it starts the chip */
+ 		printf("VINCE WLAN: SMSM tx-rings-empty %d\n", vd_smsm_rings_empty());
+ 	}
+-	/* the firmware can refuse HAL_START (status 38 seen) right after the NV download; retry a few times */
+-	for (int i = 0; (r = vw_start()) == -7 && i < 5; i++) {
++	(void)vw_load_nv();
++	/* retry HAL_START a few times if the firmware refuses it */
++	for (int i = 0; (r = vw_start()) == -7 && i < 2; i++) {
+ 		printf("VINCE WLAN: HAL_START refused, retrying in 3 s\n");
+ 		vince_smd_sleep(3000);
+ 	}
