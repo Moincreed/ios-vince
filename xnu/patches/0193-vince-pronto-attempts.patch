@@ -1,0 +1,236 @@
+xnu: 0193 vince Pronto: try the pre-start PMU setups in turn
+
+0192 (NV flag + Iris XO 48 MHz) stopped the firmware from creating its SMD
+channels; without them it starts but HAL_START answers 38. Try Iris XO
+48 MHz, Iris XO 19.2 MHz, NV flag alone, nothing; stop an attempt whose
+WCNSS_CTRL does not appear in 5 s (PAS SHUTDOWN), log the firmware crash
+reason (SMEM 422), reload, next. Boot-arg vinceiris=N tries only mode N.
+
+diff --git a/bsd/dev/vince_smd.c b/bsd/dev/vince_smd.c
+index d58cb29..b89ca11 100644
+--- a/bsd/dev/vince_smd.c
++++ b/bsd/dev/vince_smd.c
+@@ -520,34 +520,55 @@ vp_pmu_wait(volatile uint32_t *cfg, uint32_t bit, const char *what)
+ 	return false;
+ }
+ 
++/* mode bits: 1 = SPARE_OUT NV-download flag, 2 = Iris XO configuration, 4 = 19.2 MHz XO instead of 48 MHz */
++static uint32_t vp_pmu_cfg0, vp_spare0;
++static bool vp_pmu_saved;
++
+ static void
+-vp_configure_iris(void)
++vp_configure_iris(int mode)
+ {
+-	vm_offset_t pmu = ml_io_map(VP_PMU_PA, 0x1000);
++	static vm_offset_t pmu;         /* IO mappings are permanent: map the page once */
++	if (!pmu) {
++		pmu = ml_io_map(VP_PMU_PA, 0x1000);
++	}
+ 	if (!pmu) {
+ 		printf("VINCE PRONTO: PMU mapping failed\n");
+ 		return;
+ 	}
+ 	volatile uint32_t *cfg = (volatile uint32_t *)(pmu + VP_PMU_CFG), *spare = (volatile uint32_t *)(pmu + VP_SPARE_OUT);
+-	printf("VINCE PRONTO: PMU_CFG %#x SPARE_OUT %#x before Iris setup\n", *cfg, *spare);
+-	*spare |= SPARE_NVBIN_DLND;
+-	*cfg = 0;
+-	uint32_t v = PMU_GC_BUS_MUX_SEL_TOP | PMU_IRIS_XO_EN;
+-	*cfg = v;
+-	v = (v & ~(3u << 1)) | PMU_XO_MODE_48;
+-	*cfg = v;
+-	v |= PMU_IRIS_RESET;
+-	*cfg = v;
+-	bool ok = vp_pmu_wait(cfg, PMU_IRIS_RESET_STS, "reset");
+-	v &= ~PMU_IRIS_RESET;
+-	*cfg = v;
+-	v |= PMU_IRIS_XO_CFG;
+-	*cfg = v;
+-	ok = vp_pmu_wait(cfg, PMU_IRIS_XO_CFG_STS, "XO configuration") && ok;
+-	v &= ~(PMU_GC_BUS_MUX_SEL_TOP | PMU_IRIS_XO_CFG);
+-	*cfg = v;
+-	vince_smd_sleep(20);
+-	printf("VINCE PRONTO: Iris XO set up (48 MHz)%s, PMU_CFG %#x SPARE_OUT %#x\n", ok ? "" : " WITH TIMEOUTS", *cfg, *spare);
++	if (!vp_pmu_saved) {
++		vp_pmu_cfg0 = *cfg;
++		vp_spare0 = *spare;
++		vp_pmu_saved = true;
++	}
++	/* start every attempt from what LK left */
++	*cfg = vp_pmu_cfg0;
++	*spare = vp_spare0;
++	if (mode & 1) {
++		*spare |= SPARE_NVBIN_DLND;
++	}
++	bool ok = true;
++	if (mode & 2) {
++		*cfg = 0;
++		uint32_t v = PMU_GC_BUS_MUX_SEL_TOP | PMU_IRIS_XO_EN;
++		*cfg = v;
++		v = (v & ~(3u << 1)) | ((mode & 4) ? 0 : PMU_XO_MODE_48);
++		*cfg = v;
++		v |= PMU_IRIS_RESET;
++		*cfg = v;
++		ok = vp_pmu_wait(cfg, PMU_IRIS_RESET_STS, "reset");
++		v &= ~PMU_IRIS_RESET;
++		*cfg = v;
++		v |= PMU_IRIS_XO_CFG;
++		*cfg = v;
++		ok = vp_pmu_wait(cfg, PMU_IRIS_XO_CFG_STS, "XO configuration") && ok;
++		v &= ~(PMU_GC_BUS_MUX_SEL_TOP | PMU_IRIS_XO_CFG);
++		*cfg = v;
++		vince_smd_sleep(20);
++	}
++	printf("VINCE PRONTO: attempt mode %d (%s%s%s)%s: PMU_CFG %#x SPARE_OUT %#x (LK left %#x %#x)\n", mode,
++	    (mode & 1) ? "nv-flag " : "", (mode & 2) ? "iris-xo " : "", (mode & 2) ? ((mode & 4) ? "19.2MHz" : "48MHz") : "",
++	    ok ? "" : " WITH TIMEOUTS", *cfg, *spare, vp_pmu_cfg0, vp_spare0);
+ }
+ /* the NV, kept for vince_wlan.c: the WLAN HAL wants it again (DOWNLOAD_NV_REQ) before HAL_START */
+ const uint8_t *vince_pronto_nv;
+@@ -765,39 +786,6 @@ vince_pronto_boot(void)
+ 		printf("VINCE PRONTO: blob read failed\n");
+ 		goto out;
+ 	}
+-	/* firmware segments into the reserved region (device memory: 32-bit stores) */
+-	if (vp_phys(VP_FW_PA, NULL, (h.fw_span + 3) & ~3u)) {
+-		printf("VINCE PRONTO: firmware region mapping failed\n");
+-		goto out;
+-	}
+-	for (uint32_t i = 0; i < h.nchunks; i++) {
+-		uint32_t sect = h.c[i].sect, left = h.c[i].len, dst = h.c[i].dst;
+-		if (dst + h.c[i].memsz > h.fw_span || left > h.c[i].memsz) {
+-			printf("VINCE PRONTO: chunk %u out of range\n", i);
+-			goto out;
+-		}
+-		while (left > 0) {
+-			uint32_t n = MIN(left, bufsz);
+-			if (vince_mmc_part_read("boot", VP_BLOB_SECT + sect, (n + 511) / 512, buf)) {
+-				printf("VINCE PRONTO: chunk %u read failed\n", i);
+-				goto out;
+-			}
+-			if (vp_phys(VP_FW_PA + dst, buf, n)) {
+-				printf("VINCE PRONTO: firmware region mapping failed\n");
+-				goto out;
+-			}
+-			sect += n / 512;
+-			dst += n;
+-			left -= n;
+-		}
+-	}
+-	if (vp_phys(VP_FW_PA + VP_META_OFF, mdt, h.mdt_len)) {
+-		goto out;
+-	}
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-	printf("VINCE PRONTO: firmware in place: %u segments, %u KiB at %#x, metadata %u bytes, NV %u bytes\n",
+-	    h.nchunks, h.fw_span >> 10, VP_FW_PA, h.mdt_len, h.nv_len);
+-
+ 	/* crypto engine clocks for the signature check (votes; LK may have them on already) */
+ 	*(volatile uint32_t *)(vote + (GCC_VOTE_PA & 0xfffu)) |= 7u;
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+@@ -811,26 +799,88 @@ vince_pronto_boot(void)
+ 	printf("VINCE PRONTO: SCM %s convention (info %lld/%llu)\n", vp_smc64 ? "SMC64" : "SMC32", st, res);
+ 	st = vp_scm(2, 7, 1, VP_PAS_ID, 0, 0, &res);            /* PAS_IS_SUPPORTED */
+ 	printf("VINCE PRONTO: PAS supported for pas-id %u: status %lld result %llu\n", VP_PAS_ID, st, res);
+-	st = vp_scm(2, 1, 0x82, VP_PAS_ID, VP_FW_PA + VP_META_OFF, 0, &res);    /* INIT_IMAGE (val, rw buffer) */
+-	printf("VINCE PRONTO: INIT_IMAGE status %lld result %llu\n", st, res);
+-	if (st || res) {
+-		goto out;
+-	}
+-	st = vp_scm(2, 2, 3, VP_PAS_ID, VP_FW_PA, (h.fw_span + 0xfff) & ~0xfffu, &res);     /* MEM_SETUP */
+-	printf("VINCE PRONTO: MEM_SETUP status %lld result %llu\n", st, res);
+-	if (st || res) {
+-		goto out;
+-	}
+-	vp_configure_iris();
+-	st = vp_scm(2, 5, 1, VP_PAS_ID, 0, 0, &res);            /* AUTH_AND_RESET */
+-	printf("VINCE PRONTO: AUTH_AND_RESET status %lld result %llu\n", st, res);
+-	if (st || res) {
+-		goto out;
++
++	/*
++	 * Pre-start PMU setups to try, in order (boot-arg vinceiris=N tries only mode N): Iris XO 48 MHz, Iris XO
++	 * 19.2 MHz, the NV flag alone, nothing. 0192 (flag + XO 48 MHz) kept the firmware from creating its channels;
++	 * nothing at all starts it but HAL_START answers 38. An attempt whose WCNSS_CTRL does not show up within 5 s is
++	 * stopped (PAS SHUTDOWN) and the firmware reloaded for the next.
++	 */
++	static const int modes[] = { 2, 6, 1, 0 };
++	int only = -1, nmodes = (int)(sizeof(modes) / sizeof(modes[0]));
++	(void)PE_parse_boot_argn("vinceiris", &only, sizeof(only));
++	for (int m = 0; m < nmodes; m++) {
++		int mode = only >= 0 ? only : modes[m];
++		if (only >= 0 && m > 0) {
++			break;
++		}
++		if (vp_phys(VP_FW_PA, NULL, (h.fw_span + 3) & ~3u)) {
++			printf("VINCE PRONTO: firmware region write failed\n");
++			goto out;
++		}
++		for (uint32_t i = 0; i < h.nchunks; i++) {
++			uint32_t sect = h.c[i].sect, left = h.c[i].len, dst = h.c[i].dst;
++			if (dst + h.c[i].memsz > h.fw_span || left > h.c[i].memsz) {
++				printf("VINCE PRONTO: chunk %u out of range\n", i);
++				goto out;
++			}
++			while (left > 0) {
++				uint32_t n = MIN(left, bufsz);
++				if (vince_mmc_part_read("boot", VP_BLOB_SECT + sect, (n + 511) / 512, buf)) {
++					printf("VINCE PRONTO: chunk %u read failed\n", i);
++					goto out;
++				}
++				(void)vp_phys(VP_FW_PA + dst, buf, n);
++				sect += n / 512;
++				dst += n;
++				left -= n;
++			}
++		}
++		(void)vp_phys(VP_FW_PA + VP_META_OFF, mdt, h.mdt_len);
++		printf("VINCE PRONTO: firmware in place: %u segments, %u KiB at %#x, metadata %u bytes, NV %u bytes\n",
++		    h.nchunks, h.fw_span >> 10, VP_FW_PA, h.mdt_len, h.nv_len);
++		st = vp_scm(2, 1, 0x82, VP_PAS_ID, VP_FW_PA + VP_META_OFF, 0, &res);    /* INIT_IMAGE (val, rw buffer) */
++		printf("VINCE PRONTO: INIT_IMAGE status %lld result %llu\n", st, res);
++		if (st || res) {
++			goto out;
++		}
++		st = vp_scm(2, 2, 3, VP_PAS_ID, VP_FW_PA, (h.fw_span + 0xfff) & ~0xfffu, &res);     /* MEM_SETUP */
++		printf("VINCE PRONTO: MEM_SETUP status %lld result %llu\n", st, res);
++		if (st || res) {
++			goto out;
++		}
++		vp_configure_iris(mode);
++		st = vp_scm(2, 5, 1, VP_PAS_ID, 0, 0, &res);            /* AUTH_AND_RESET */
++		printf("VINCE PRONTO: AUTH_AND_RESET status %lld result %llu\n", st, res);
++		if (st || res) {
++			goto out;
++		}
++		printf("VINCE PRONTO: Pronto started (mode %d)\n", mode);
++		if (vp_ctrl(nv, h.nv_len) != -1) {
++			break;
++		}
++		/* no WCNSS_CTRL: the firmware's crash reason, if it wrote one, then stop it for the next attempt */
++		uint32_t sz = 0;
++		vm_offset_t why = vince_smd_item(422, &sz);
++		if (why && sz) {
++			char t[96];
++			uint32_t k;
++			for (k = 0; k < sizeof(t) - 1 && k < sz; k++) {
++				char ch = *(volatile char *)(why + k);
++				t[k] = (ch >= 32 && ch < 127) ? ch : (ch ? '.' : 0);
++				if (!ch) {
++					break;
++				}
++			}
++			t[k] = 0;
++			printf("VINCE PRONTO: firmware crash reason: \"%s\"\n", t);
++		}
++		st = vp_scm(2, 6, 1, VP_PAS_ID, 0, 0, &res);            /* PAS SHUTDOWN */
++		printf("VINCE PRONTO: SHUTDOWN status %lld result %llu\n", st, res);
++		vince_smd_sleep(200);
+ 	}
+-	printf("VINCE PRONTO: Pronto started\n");
+-	(void)vp_ctrl(nv, h.nv_len);
+ 	if (h.nv_len > 4) {
+-		vince_pronto_nv = nv;           /* kept (not freed below) */
++		vince_pronto_nv = nv;           /* kept for the WLAN HAL (not freed below) */
+ 		vince_pronto_nv_len = h.nv_len;
+ 		nv = NULL;
+ 	}
