@@ -1,0 +1,36 @@
+xnu: 0202 vince Wi-Fi: queue whole received frames (2400 bytes, not 512)
+
+On the phone (0201 + vinceui=2): iOS joined "OnePlus 8T", got 10.169.106.8
+by DHCP, DNS and NTP answered, TLS connections opened - but every received
+packet was 494 bytes or less: vd_frame cut frames at VD_Q_FRAME_MAX = 512, so
+every larger packet reached the stack truncated and was dropped (Safari
+never loaded a page). Raise it to 2400, and the queue from 16 to 64 frames.
+
+diff --git a/bsd/dev/vince_wlan.h b/bsd/dev/vince_wlan.h
+index f8a82be..2f72236 100755
+--- a/bsd/dev/vince_wlan.h
++++ b/bsd/dev/vince_wlan.h
+@@ -10,8 +10,8 @@
+ #include <stddef.h>
+ 
+ #define VD_MAX_BSS              96
+-#define VD_Q_FRAMES             16
+-#define VD_Q_FRAME_MAX          512
++#define VD_Q_FRAMES             64      /* bursts of full-size TCP segments (0202) */
++#define VD_Q_FRAME_MAX          2400    /* a whole 802.11 data frame (1500-byte MTU + headers); 512 cut every larger packet (0202) */
+ 
+ struct vd_bss {
+ 	uint8_t bssid[6];
+diff --git a/bsd/dev/vince_wlan_dxe.c b/bsd/dev/vince_wlan_dxe.c
+index acf78d2..e209d24 100755
+--- a/bsd/dev/vince_wlan_dxe.c
++++ b/bsd/dev/vince_wlan_dxe.c
+@@ -512,7 +512,7 @@ push_frame(const uint8_t *f, uint32_t n, uint32_t hwch, int rssi)
+ static void
+ note_frame(const volatile uint8_t *buf, uint32_t hdr_off, uint32_t len, uint32_t hwch, int rssi)
+ {
+-	uint8_t f[VD_Q_FRAME_MAX];
++	static uint8_t f[VD_Q_FRAME_MAX];      /* static: 2400 bytes; vd_poll runs on the Wi-Fi driver thread */
+ 	uint32_t n = len < sizeof(f) ? len : (uint32_t)sizeof(f);
+ 	uint32_t fc, type, sub;
+ 	bool is_beacon;
