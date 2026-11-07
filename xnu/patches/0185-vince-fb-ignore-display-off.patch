@@ -1,0 +1,26 @@
+xnu: 0185 vince keep presenting frames when backboardd turns the display off
+
+The LCD backlight stays on, so the AMOLED-style fade to black leaves a
+lit black screen after auto-lock. Ignore RequestPowerChange(0).
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index bf90e43..f4a57bc 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -673,7 +673,15 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		break;
+ 	case kSweetFBRequestPowerChange:
+ 		if (args->scalarInputCount >= 1) {
+-			bool off = args->scalarInput[0] == 0;
++			/*
++			 * VINCE: the Redmi 5 Plus LCD keeps its backlight on, so the
++			 * "display off" fade leaves a lit black screen that looks dead.
++			 * Keep presenting frames; log the request so the state is visible.
++			 */
++			if (args->scalarInput[0] == 0) {
++				IOLog("SWEET FB: display off requested - ignored on vince\n");
++			}
++			bool off = false;
+ 			IOLockLock(fFB->fLock);
+ 			if (off != fFB->fPowerOff) {
+ 				fFB->fPowerOff = off;
