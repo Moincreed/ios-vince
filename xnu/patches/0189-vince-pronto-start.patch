@@ -1,10 +1,10 @@
 xnu: 0189 vince Pronto (WCNSS) start in the kernel
 
 boot-arg vincepronto=1: load the Wi-Fi firmware packed behind the boot image
-(tools/mkwcnss_blob.py) into wcnss_fw_region through 64 KiB device windows,
-start it through TrustZone PAS (INIT_IMAGE, MEM_SETUP, AUTH_AND_RESET,
-pas-id 6), then the WCNSS_CTRL version request and NV download - what the
-private vince-bringup shim did.
+(tools/mkwcnss_blob.py) into wcnss_fw_region with physical writes, start it
+through TrustZone PAS (INIT_IMAGE, MEM_SETUP, AUTH_AND_RESET, pas-id 6),
+then the WCNSS_CTRL version request and NV download - what the private
+vince-bringup shim did.
 
 diff --git a/bsd/dev/vince_mmc.c b/bsd/dev/vince_mmc.c
 index d01f787..1cc102a 100644
@@ -51,10 +51,10 @@ index d01f787..1cc102a 100644
  int vince_mmc_rootdev(dev_t *dev);
  
 diff --git a/bsd/dev/vince_smd.c b/bsd/dev/vince_smd.c
-index 1653ade..a2a5cd5 100644
+index 1653ade..48ddead 100644
 --- a/bsd/dev/vince_smd.c
 +++ b/bsd/dev/vince_smd.c
-@@ -25,9 +25,11 @@
+@@ -25,6 +25,7 @@
  #include <kern/sched_prim.h>
  #include <machine/machine_routines.h>
  #include <pexpert/pexpert.h>
@@ -62,11 +62,7 @@ index 1653ade..a2a5cd5 100644
  #include "vince_smd.h"
  
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
-+extern void ml_io_unmap(vm_offset_t, vm_size_t);
- extern kern_return_t thread_terminate(thread_t);
- void vince_smd_start(void);
- extern void vince_wlan_start(void);
-@@ -455,6 +457,320 @@ vince_smd_map(void)
+@@ -455,6 +456,311 @@ vince_smd_map(void)
  	return smem && apcs;
  }
  
@@ -151,43 +147,34 @@ index 1653ade..a2a5cd5 100644
 +}
 +
 +/*
-+ * Physical writes into wcnss_fw_region through 64 KiB device mappings, one at a time: one 7 MiB ml_io_map panics
-+ * (kmem_alloc of the whole size fails, seen on the phone). src NULL = zero fill. 32-bit stores only.
++ * Physical writes into wcnss_fw_region with ml_phys_write_*_64 (a per-CPU copy window per store, IO attributes for
++ * memory outside the kernel's DRAM). Not ml_io_map: one 7 MiB mapping panics (kmem_alloc fails), and IO mappings are
++ * permanent, so smaller ones cannot be unmapped (vm_map_delete panic) - both seen on the phone. src NULL = zero fill.
 + */
-+#define VP_WIN          0x10000u
++extern void ml_phys_write_double_64(addr64_t, unsigned long long);
++extern void ml_phys_write_word_64(addr64_t, unsigned int);
++extern void ml_phys_write_byte_64(addr64_t, unsigned int);
 +
 +static int
 +vp_phys(uint32_t pa, const uint8_t *src, uint32_t len)
 +{
-+	while (len > 0) {
-+		uint32_t base = pa & ~(VP_WIN - 1), off = pa - base, n = MIN(len, VP_WIN - off);
-+		vm_offset_t w = ml_io_map(base, VP_WIN);
-+		if (!w) {
-+			return -1;
-+		}
-+		uint32_t i = 0;
-+		for (; i + 4 <= n; i += 4) {
-+			uint32_t v = 0;
-+			if (src) {
-+				memcpy(&v, src + i, 4);
-+			}
-+			*(volatile uint32_t *)(w + off + i) = v;
-+		}
-+		if (i < n) {
-+			uint32_t v = 0;
-+			if (src) {
-+				memcpy(&v, src + i, n - i);
-+			}
-+			*(volatile uint32_t *)(w + off + i) = v;
-+		}
-+		__asm__ volatile ("dsb sy" ::: "memory");
-+		ml_io_unmap(w, VP_WIN);
-+		pa += n;
-+		len -= n;
-+		if (src) {
-+			src += n;
-+		}
++	uint32_t i = 0;
++
++	while (i < len && ((pa + i) & 7)) {
++		ml_phys_write_byte_64(pa + i, src ? src[i] : 0);
++		i++;
 +	}
++	for (; i + 8 <= len; i += 8) {
++		uint64_t v = 0;
++		if (src) {
++			memcpy(&v, src + i, 8);
++		}
++		ml_phys_write_double_64(pa + i, v);
++	}
++	for (; i < len; i++) {
++		ml_phys_write_byte_64(pa + i, src ? src[i] : 0);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
 +	return 0;
 +}
 +
@@ -387,7 +374,7 @@ index 1653ade..a2a5cd5 100644
  void
  vince_smd_start(void)
  {
-@@ -465,6 +781,17 @@ vince_smd_start(void)
+@@ -465,6 +771,17 @@ vince_smd_start(void)
  		return;
  	}
  	smd_started = true;
