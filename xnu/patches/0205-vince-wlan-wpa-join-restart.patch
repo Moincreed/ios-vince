@@ -1,0 +1,82 @@
+xnu: 0205 vince Wi-Fi: alternate the post-association pause; restart fixes
+
+Phone with 0204: open joins work (2 MB of HTTPS received), WPA2 joins still
+assert the firmware at SET_LINK(POSTASSOC) - EAPOL message 1 arrives around
+that request. Alternate the pause after the association answer (0 / 150 ms)
+on each failed join. After a restart wait for the fresh WLAN_CTRL half too
+(DOWNLOAD_NV timed out on the stale one), retry a failed restart 3 times
+instead of giving Wi-Fi up, and log the APPLE80211 power state iOS sets
+(Wi-Fi off/on in Settings left it unavailable).
+
+diff --git a/bsd/dev/vince_smd.c b/bsd/dev/vince_smd.c
+index 8deac07..8f94436 100644
+--- a/bsd/dev/vince_smd.c
++++ b/bsd/dev/vince_smd.c
+@@ -1393,6 +1393,17 @@ vince_pronto_boot_ex(bool restart)
+ 		if (vp_ctrl(nv, h.nv_len) != -1) {
+ 			vp_good_mode = mode;
+ 			result = 0;
++			if (restart) {
++				/* 0205: the same for WLAN_CTRL, whose stale OPENED half made DOWNLOAD_NV time out after 0204's restart */
++				struct vsmd_ch w;
++				int t = 0;
++				while (t < 600 && (!vince_smd_find("WLAN_CTRL", &w) || rd32(w.info + I_HALF + I_STATE) == ST_OPENED)) {
++					vince_smd_sleep(25);
++					t++;
++				}
++				printf("VINCE PRONTO: restart: firmware half of WLAN_CTRL is %u after %d ms\n",
++				    vince_smd_find("WLAN_CTRL", &w) ? rd32(w.info + I_HALF + I_STATE) : 99u, t * 25);
++			}
+ 			break;
+ 		}
+ 		/* no WCNSS_CTRL: the firmware's crash reason, if it wrote one, then stop it for the next attempt */
+diff --git a/bsd/dev/vince_wlan.c b/bsd/dev/vince_wlan.c
+index 01303ed..709df0d 100755
+--- a/bsd/dev/vince_wlan.c
++++ b/bsd/dev/vince_wlan.c
+@@ -1403,6 +1403,16 @@ vui_loop(int stage)
+ 			vui_scan();
+ 		} else if (c == 2) {
+ 			if (vui_assoc(&a, stage)) {
++				/*
++				 * 0205: WPA2 joins made the firmware assert at SET_LINK(POSTASSOC) when EAPOL message 1 arrived
++				 * around it (open joins pass). The upstream notes disagree on sending the post-association
++				 * request at once or after the AP's first frames: alternate 0 / 150 ms after each failed join.
++				 */
++				static int settle_alt;
++				settle_alt ^= 1;
++				va_set_settle(settle_alt ? 150 : 0);
++				printf("VINCE UI: join failed; next join waits %d ms after the association answer\n",
++				    settle_alt ? 150 : 0);
+ 				c = 8;
+ 			}
+ 		} else if (c == 4) {
+@@ -1413,7 +1423,15 @@ vui_loop(int stage)
+ 			printf("VINCE UI: restarting Pronto\n");
+ 			vif_link(false);
+ 			vui_set_state(VUI_S_INIT);
+-			if (vw_restart_pronto() || vw_bringup(stage) || vw_prepare(NULL)) {
++			int tries;
++			for (tries = 0; tries < 3; tries++) {
++				if (!vw_restart_pronto() && !vw_bringup(stage) && !vw_prepare(NULL)) {
++					break;
++				}
++				printf("VINCE UI: Wi-Fi restart attempt %d failed\n", tries + 1);
++				vince_smd_sleep(2000);
++			}
++			if (tries == 3) {
+ 				printf("VINCE UI: Wi-Fi could not be brought back\n");
+ 				break;
+ 			}
+diff --git a/bsd/dev/vince_wlan_if.c b/bsd/dev/vince_wlan_if.c
+index 5158fdb..fdcb698 100755
+--- a/bsd/dev/vince_wlan_if.c
++++ b/bsd/dev/vince_wlan_if.c
+@@ -248,6 +248,7 @@ a80211_handle(uint32_t type, bool get, uint8_t *kb, uint32_t len, uint32_t *val)
+ 			}
+ 		} else if (len >= 12) {
+ 			a80211_power = kb[8] | (uint32_t)kb[9] << 8;
++			printf("VINCE A80211: POWER set to %u (len %u, radios %u)\n", a80211_power, len, kb[4]);
+ 			if (ui) {
+ 				vui_set_power(a80211_power != 0);
+ 			}
