@@ -1,0 +1,99 @@
+xnu: 0201 vince Wi-Fi: DXE diagnostics and a second scan
+
+0200 on the phone: Iris WCN3660B detected, XO 48 MHz, cold boot calibration
+complete, HAL_START status 0 ("WCN v2.0 RadioPhy vIris_TSMC_4.0 with 48MHz
+XO"), but the scan counted no RX frames at all. Log the DXE engine, channel
+registers and ring state after the scan, and scan once more after 5 s.
+
+diff --git a/bsd/dev/vince_wlan.c b/bsd/dev/vince_wlan.c
+index 9e28865..afde737 100755
+--- a/bsd/dev/vince_wlan.c
++++ b/bsd/dev/vince_wlan.c
+@@ -443,6 +443,9 @@ vw_prepare(struct vd_tx_ctx *ctx)
+ 	return 0;
+ }
+ 
++extern void vd_dump(const char *when);
++static int s_rescan;
++
+ /* X2: DXE up, self station, active scan of channels 1..13 (120 ms each, two probe requests at the start) */
+ static int
+ vw_scan_all(void)
+@@ -487,6 +490,30 @@ vw_scan_all(void)
+ 	printf("VINCE WLAN: FINISH_SCAN %d\n", r);
+ 	vd_poll(50);
+ 	vw_log_bss();
++	vd_dump("after scan 1");
++	if (s_rescan++ == 0) {
++		/* 0201: once more after 5 s, in case the radio was still settling after the cold boot calibration */
++		vince_smd_sleep(5000);
++		vd_bss_clear();
++		r = vw_scan_init();
++		for (uint8_t ch = 1; ch <= 13 && !r; ch++) {
++			if (vw_scan_start(ch)) {
++				break;
++			}
++			for (int k = 0; k < 2; k++) {
++				(void)vd_tx_mgmt(&ctx, pr, prlen, 1);
++				vd_poll(10);
++			}
++			vd_poll(200);
++			if (vw_scan_end(ch)) {
++				break;
++			}
++		}
++		printf("VINCE WLAN: second scan FINISH_SCAN %d\n", vw_scan_finish(1));
++		vd_poll(50);
++		vw_log_bss();
++		vd_dump("after scan 2");
++	}
+ 	return 0;
+ }
+ 
+diff --git a/bsd/dev/vince_wlan_dxe.c b/bsd/dev/vince_wlan_dxe.c
+index caa9a26..acf78d2 100755
+--- a/bsd/dev/vince_wlan_dxe.c
++++ b/bsd/dev/vince_wlan_dxe.c
+@@ -732,6 +732,42 @@ vd_poll(uint32_t ms)
+ 	s_stats.status_rx_h = drd(RX_H_OFF + CH_STATUS);
+ }
+ 
++/*
++ * Diagnostics (0201): the DXE engine and ring state, to tell "the chip never delivered" from "the ring never armed".
++ * On the phone with 0200 the HAL came up (status 0) but a scan counted no RX frames at all.
++ */
++void vd_dump(const char *when);
++
++void
++vd_dump(const char *when)
++{
++	if (!s_ready) {
++		printf("VINCE DXE %s: not initialised\n", when);
++		return;
++	}
++	printf("VINCE DXE %s: csr %#x int_mask %#x int_src_raw %#x ccu_sel %#x\n", when, drd(REG_CSR_RESET),
++	    drd(REG_INT_MASK), drd(REG_INT_SRC_RAW), *(volatile uint32_t *)(ccu_v + CCU_DXE_INT_SELECT_PRONTO));
++	static const struct { uint32_t off; const char *name; } ch[4] = {
++		{ RX_L_OFF, "rx_l" }, { RX_H_OFF, "rx_h" }, { TX_L_OFF, "tx_l" }, { TX_H_OFF, "tx_h" },
++	};
++	for (int i = 0; i < 4; i++) {
++		printf("VINCE DXE %s: %s ctl %#x status %#x src %#x dst %#x next %#x\n", when, ch[i].name,
++		    drd(ch[i].off), drd(ch[i].off + CH_STATUS), drd(ch[i].off + CH_SRC_ADDR), drd(ch[i].off + CH_DEST_ADDR),
++		    drd(ch[i].off + CH_NEXT_DESC));
++	}
++	struct vch *rings[4] = { &rx_l, &rx_h, &tx_l, &tx_h };
++	for (int i = 0; i < 4; i++) {
++		uint32_t valid = 0;
++		for (uint32_t k = 0; k < rings[i]->n; k++) {
++			valid += (rings[i]->d[k].ctrl & C_VLD) ? 1 : 0;
++		}
++		volatile struct vdesc *d0 = &rings[i]->d[0];
++		printf("VINCE DXE %s: %s ring at %#x head %u, %u of %u descriptors valid; d0 ctrl %#x len %u src %#x dst %#x next %#x\n",
++		    when, ch[i].name, rings[i]->dma, rings[i]->head, valid, rings[i]->n, d0->ctrl, d0->fr_len, d0->src_l,
++		    d0->dst_l, d0->next_l);
++	}
++}
++
+ const struct vd_bss *
+ vd_bss_list(uint32_t *n)
+ {
