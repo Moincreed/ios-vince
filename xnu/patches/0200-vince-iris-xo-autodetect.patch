@@ -1,0 +1,114 @@
+xnu: 0200 vince Pronto: downstream Iris XO auto-detect, fix the 48 MHz value
+
+The XO mode for 48 MHz is 3 (downstream WCNSS_PMU_CFG_IRIS_XO_MODE_48 =
+3 << 1, mainline WCNSS_PMU_XO_MODE_48 = 3); 0193..0199 wrote 2, an invalid
+mode, so every 48 MHz attempt never came up. Add mode 8: the downstream
+configure_iris_xo() sequence with qcom,has-autodetect-xo - read the Iris chip
+id through PMU 0x1134 (works now that 0198 muxes the WCSS pins), log it, and
+pick 48 / 19.2 MHz from bits 31:30. Order: auto, 48 MHz, 19.2 MHz.
+
+diff --git a/bsd/dev/vince_smd.c b/bsd/dev/vince_smd.c
+index ff70b27..293ed58 100644
+--- a/bsd/dev/vince_smd.c
++++ b/bsd/dev/vince_smd.c
+@@ -505,7 +505,12 @@ static bool vp_smc64 = true;
+ #define PMU_IRIS_XO_CFG_STS     (1u << 6)
+ #define PMU_IRIS_RESET          (1u << 7)
+ #define PMU_IRIS_RESET_STS      (1u << 8)
+-#define PMU_XO_MODE_48          (2u << 1)
++#define PMU_XO_MODE_48          (3u << 1)       /* mode 3 (downstream WCNSS_PMU_CFG_IRIS_XO_MODE_48, mainline MODE_48 = 3); 0193..0199 wrote 2 */
++#define PMU_XO_MODE_MASK        (3u << 1)
++#define PMU_IRIS_XO_READ        (1u << 9)
++#define PMU_IRIS_XO_READ_STS    (1u << 10)
++#define VP_IRIS_READ            0x134u          /* PMU page offset of PRONTO_IRIS_REG_READ (0x0A21B000 + 0x1134) */
++#define IRIS_REG_CHIP_ID        0x04u
+ #define SPARE_NVBIN_DLND        (1u << 25)
+ 
+ static bool
+@@ -549,7 +554,66 @@ vp_configure_iris(int mode)
+ 		*spare |= SPARE_NVBIN_DLND;
+ 	}
+ 	bool ok = true;
+-	if (mode & 2) {
++	if (mode & 8) {
++		/*
++		 * Downstream wcnss_vreg.c configure_iris_xo() with qcom,has-autodetect-xo (the phone's DT): XO enable,
++		 * read the Iris chip id through the PMU (needs the 0198 pins), 48 MHz for a 3660/3680-class Iris,
++		 * 19.2 MHz for 3620/3610, then the XO configuration.
++		 */
++		volatile uint32_t *rd = (volatile uint32_t *)(pmu + VP_IRIS_READ);
++		*spare |= SPARE_NVBIN_DLND;
++		*cfg = 0;
++		uint32_t v = *cfg | PMU_GC_BUS_MUX_SEL_TOP | PMU_IRIS_XO_EN;
++		*cfg = v;
++		uint32_t iris = *rd;
++		v |= PMU_IRIS_RESET;
++		*cfg = v;
++		ok = vp_pmu_wait(cfg, PMU_IRIS_RESET_STS, "reset");
++		v &= ~PMU_IRIS_RESET;
++		*cfg = v;
++		iris = (iris & 0xffffu) | IRIS_REG_CHIP_ID;
++		*rd = iris;
++		int valid = 0;
++		for (int i = 0; i < 6 && !valid; i++) {
++			v |= PMU_IRIS_XO_READ;
++			*cfg = v;
++			ok = vp_pmu_wait(cfg, PMU_IRIS_XO_READ_STS, "chip id read") && ok;
++			iris = *rd;
++			uint32_t id = iris >> 16;
++			valid = id == 0x0200 || id == 0x0300 || id == 0x0400 || id == 0x5111 || id == 0x5112 ||
++			    id == 0x9101 || id == 0x9110;
++			printf("VINCE PRONTO: Iris reg %#010x (id %#06x%s)\n", iris, id, valid ? "" : ", not a known Iris");
++			v &= ~PMU_IRIS_XO_READ;
++			*cfg = v;
++			if (!valid) {
++				v |= PMU_IRIS_RESET;
++				*cfg = v;
++				(void)vp_pmu_wait(cfg, PMU_IRIS_RESET_STS, "reset");
++				v &= ~PMU_IRIS_RESET;
++				*cfg = v;
++			}
++		}
++		/* xo_auto_detect(): bits 31:30 - 0 = 3660 class (48 MHz), 1 = 3620, 2 = 3610 (19.2 MHz) */
++		bool mhz48 = valid ? (iris >> 30) == 0 : !(mode & 4);
++		v &= ~(PMU_IRIS_XO_READ | PMU_XO_MODE_MASK);
++		if (mhz48) {
++			v |= PMU_XO_MODE_48;
++		}
++		*cfg = v;
++		v |= PMU_IRIS_RESET;
++		*cfg = v;
++		ok = vp_pmu_wait(cfg, PMU_IRIS_RESET_STS, "reset") && ok;
++		v &= ~PMU_IRIS_RESET;
++		*cfg = v;
++		v |= PMU_IRIS_XO_CFG;
++		*cfg = v;
++		ok = vp_pmu_wait(cfg, PMU_IRIS_XO_CFG_STS, "XO configuration") && ok;
++		v &= ~(PMU_GC_BUS_MUX_SEL_TOP | PMU_IRIS_XO_CFG);
++		*cfg = v;
++		vince_smd_sleep(20);
++		printf("VINCE PRONTO: Iris %s, XO %s MHz\n", valid ? ((iris >> 30) == 0 ? "3660/3680 class" :
++		    (iris >> 30) == 1 ? "3620 class" : "3610 class") : "not detected", mhz48 ? "48" : "19.2");
++	} else if (mode & 2) {
+ 		*cfg = 0;
+ 		uint32_t v = PMU_GC_BUS_MUX_SEL_TOP | PMU_IRIS_XO_EN;
+ 		*cfg = v;
+@@ -568,7 +632,8 @@ vp_configure_iris(int mode)
+ 		vince_smd_sleep(20);
+ 	}
+ 	printf("VINCE PRONTO: attempt mode %d (%s%s%s)%s: PMU_CFG %#x SPARE_OUT %#x (LK left %#x %#x)\n", mode,
+-	    (mode & 1) ? "nv-flag " : "", (mode & 2) ? "iris-xo " : "", (mode & 2) ? ((mode & 4) ? "19.2MHz" : "48MHz") : "",
++	    (mode & 8) ? "downstream auto-detect " : (mode & 1) ? "nv-flag " : "", (mode & 2) ? "iris-xo " : "",
++	    (mode & 2) ? ((mode & 4) ? "19.2MHz" : "48MHz") : "",
+ 	    ok ? "" : " WITH TIMEOUTS", *cfg, *spare, vp_pmu_cfg0, vp_spare0);
+ }
+ /* the NV, kept for vince_wlan.c: the WLAN HAL wants it again (DOWNLOAD_NV_REQ) before HAL_START */
+@@ -1236,7 +1301,7 @@ vince_pronto_boot(void)
+ 			vp_wcss_pins();
+ 		}
+ 	}
+-	static const int modes[] = { 6, 7, 0 };
++	static const int modes[] = { 8, 3, 7 };
+ 	int only = -1, nmodes = (int)(sizeof(modes) / sizeof(modes[0]));
+ 	(void)PE_parse_boot_argn("vinceiris", &only, sizeof(only));
+ 	for (int m = 0; m < nmodes; m++) {
