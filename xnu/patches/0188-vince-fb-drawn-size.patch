@@ -1,0 +1,59 @@
+xnu: 0188 vince boot-args vincefb_lw/vincefb_lh (drawn display size)
+
+Let iOS draw a smaller screen (e.g. iPhone XR 828x1792 @2x) that the
+framebuffer scales to the 1080x2160 panel; touch maps through the same size.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index f4a57bc..60c96ca 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -207,6 +207,18 @@ AppleCLCD::start(IOService *provider)
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++	/*
++	 * vincefb_lw / vincefb_lh: the size iOS draws (e.g. 828x1792, an iPhone XR screen at @2x, with the ADT built by
++	 * mkadt_vince.py --xr); scaled to the panel below. Fewer pixels for CoreAnimation's CPU renderer.
++	 */
++	uint32_t lw = 0, lh = 0;
++	if (!native && PE_parse_boot_argn("vincefb_lw", &lw, sizeof(lw)) && PE_parse_boot_argn("vincefb_lh", &lh, sizeof(lh)) &&
++	    lw >= 320 && lh >= 480 && lw <= 2048 && lh <= 4096) {
++		fLogicalW = lw;
++		fLogicalH = lh;
++	}
++#endif
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+ 	fShadowW = fWidth;
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 7000d01..624ea88 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -441,8 +441,15 @@ SweetHIDTouch::start(IOService *provider)
+ 	}
+ 	int native = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+-	fLogicalW = native ? 1080 : 1125;
+-	fLogicalH = native ? SWEET_TOUCH_PANEL_H : 2436;
++	int lw = 1125, lh = 2436, blw = 0, blh = 0;
++	/* same as SweetFramebuffer.cpp: vincefb_lw / vincefb_lh set the drawn size */
++	if (PE_parse_boot_argn("vincefb_lw", &blw, sizeof(blw)) && PE_parse_boot_argn("vincefb_lh", &blh, sizeof(blh)) &&
++	    blw >= 320 && blh >= 480 && blw <= 2048 && blh <= 4096) {
++		lw = blw;
++		lh = blh;
++	}
++	fLogicalW = native ? 1080 : lw;
++	fLogicalH = native ? SWEET_TOUCH_PANEL_H : lh;
+ 	fOffX = (fLogicalW - 1080) / 2;
+ 	fOffY = (fLogicalH - SWEET_TOUCH_PANEL_H) / 2;
+ 	fMinX = 0;
+@@ -452,7 +459,7 @@ SweetHIDTouch::start(IOService *provider)
+ 	PE_parse_boot_argn("vincefb_crop", &crop, sizeof(crop));
+ 	if (!native && !crop) {
+ 		/* SweetFramebuffer.cpp shows 1125x2436 scaled into 1000x2160 at column 40: undo exactly that */
+-		int outW = ((1125 * SWEET_TOUCH_PANEL_H + 2436 / 2) / 2436 + 4) & ~7;
++		int outW = ((lw * SWEET_TOUCH_PANEL_H + lh / 2) / lh + 4) & ~7;
+ 		int fill = 0;
+ 		PE_parse_boot_argn("vincefb_fill", &fill, sizeof(fill));
+ 		if (fill) {

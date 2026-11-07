@@ -144,7 +144,8 @@ def build_vince_adt(seed=None):
         ph(),
         ('compatible', cstr('generic-sdhci') + cstr('qcom,sdhci-msm-v4') + b'\0'),
         ('reg', u64(SDHCI, SDHCI_SIZE)),
-        ('interrupts', u32(0, 123, 4)),  # SPI 123
+        # no 'interrupts': the vince MMC driver is polled PIO, and an interrupts property without
+        # interrupt-parent sends IODTMapOneInterrupt into an endless loop at arm-io (IODeviceTreeSupport.cpp:579)
     ])
 
     # Synaptics RMI4 Touchscreen Node
@@ -153,7 +154,7 @@ def build_vince_adt(seed=None):
         ('compatible', cstr('synaptics,rmi4') + b'\0'),
         ('i2c-address', u32(0x20)),
         ('i2c-bus', u32(3)),
-        ('interrupts', u32(0, 65, 2)),  # GPIO 65
+        # no 'interrupts': touch is polled over QUP (0099-vince-input); GPIO 65 is not a GIC SPI
     ])
 
     # No Wi-Fi or Bluetooth driver: MobileGestalt's WifiAddress/BluetoothAddress (for the A11-style UniqueDeviceID)
@@ -264,13 +265,45 @@ def build_vince_adt(seed=None):
 
     return root
 
+def find(n, name):
+    if dict((k, v) for k, f, v in n.props).get('name') == cstr(name):
+        return n
+    for c in n.children:
+        r = find(c, name)
+        if r is not None:
+            return r
+    return None
+
+def set_prop(n, key, value):
+    for i, (k, f, v) in enumerate(n.props):
+        if k == key:
+            n.props[i] = (k, f, value)
+            return
+    n.props.append((key, 0, value))
+
+def make_xr(root):
+    """--xr: iOS draws an iPhone XR screen, 414x896 points @2x = 828x1792 (2.2x fewer pixels than 1125x2436 for the
+    CPU renderer, same tall shape as the 1080x2160 panel, gestures and no red status bar, as herolte --scale2).
+    Kernel boot-args to match: vincefb_lw=828 vincefb_lh=1792 (and mgreset=1 once, so MobileGestalt re-reads this)."""
+    set_prop(find(root, 'chosen'), 'display-scale', u32(2))
+    disp0 = find(root, 'disp0')
+    set_prop(disp0, 'canvas-width', u32(828))
+    set_prop(disp0, 'canvas-height', u32(1792))
+    product = find(root, 'product')
+    set_prop(product, 'artwork-device-subtype', u32(1792))
+    set_prop(product, 'artwork-scale-factor', u32(2))
+    return root
+
 def main():
     parser = argparse.ArgumentParser(description="Generate Vince Apple Device Tree")
     parser.add_argument("output", help="Output .adt file path")
     parser.add_argument("--dump", action="store_true", help="Print human readable tree")
+    parser.add_argument("--xr", action="store_true", help="iPhone XR screen 828x1792 @2x (faster; boot-args vincefb_lw=828 vincefb_lh=1792)")
     args = parser.parse_args()
 
     root = build_vince_adt()
+    if args.xr:
+        make_xr(root)
     data = adt.serialize(root)
     with open(args.output, "wb") as f:
         f.write(data)
