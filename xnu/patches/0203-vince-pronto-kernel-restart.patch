@@ -1,0 +1,177 @@
+xnu: 0203 vince Wi-Fi: restart Pronto from the kernel
+
+On the phone (0202): a join failed at step 9 (set link postassoc) with a HAL
+timeout; the driver then asked the shim to restart Pronto, but the kernel
+starts Pronto now (0189+) and the shim has no restart service, so Wi-Fi
+stayed dead for the rest of the boot. Restart it ourselves: PAS SHUTDOWN,
+reload, the setup that worked, WCNSS_CTRL handshake and NV.
+
+diff --git a/bsd/dev/vince_smd.c b/bsd/dev/vince_smd.c
+index 293ed58..2a0d490 100644
+--- a/bsd/dev/vince_smd.c
++++ b/bsd/dev/vince_smd.c
+@@ -1234,10 +1234,18 @@ vince_iris_power(void)
+ 	vr_ldo_log("after");
+ }
+ 
+-static void
+-vince_pronto_boot(void)
++static int vp_good_mode = -1;           /* the pre-start setup that brought the firmware up (for restarts) */
++static uint32_t vince_pronto_nv_alloc;
++
++/*
++ * Load and start Pronto. restart: Pronto was running (the Wi-Fi driver lost it): stop it through TrustZone first,
++ * keep the RPM votes and pins, and use the setup that worked before. 0 when WCNSS_CTRL answered.
++ */
++static int
++vince_pronto_boot_ex(bool restart)
+ {
+ 	static struct vp_hdr h;
++	int result = -1;
+ 	uint8_t *buf = NULL, *mdt = NULL, *nv = NULL;
+ 	const uint32_t bufsz = 64 * 1024;
+ 	uint64_t res = 0;
+@@ -1248,15 +1256,18 @@ vince_pronto_boot(void)
+ 	_Static_assert(sizeof(h) <= sizeof(hbuf), "blob header");
+ 	if ((error = vince_mmc_part_read("boot", VP_BLOB_SECT, 2, hbuf)) != 0) {
+ 		printf("VINCE PRONTO: blob header unreadable (%d)\n", error);
+-		return;
++		return -1;
+ 	}
+ 	memcpy(&h, hbuf, sizeof(h));
+ 	if (memcmp(h.magic, "VWCNSS01", 8) != 0 || h.nchunks > VP_MAX_CHUNKS || h.fw_span > VP_META_OFF ||
+ 	    h.mdt_len == 0 || h.mdt_len > 0x10000 || h.nv_len > 0x20000) {
+ 		printf("VINCE PRONTO: no firmware blob at boot+40 MiB (flash the boot image with the Wi-Fi blob)\n");
+-		return;
++		return -1;
++	}
++	static vm_offset_t vote;                /* IO mappings are permanent: once */
++	if (!vote) {
++		vote = ml_io_map(GCC_VOTE_PA & ~0xfffu, 0x1000);
+ 	}
+-	vm_offset_t vote = ml_io_map(GCC_VOTE_PA & ~0xfffu, 0x1000);
+ 	buf = kalloc_data(bufsz, Z_WAITOK);
+ 	mdt = kalloc_data((h.mdt_len + 511) & ~511u, Z_WAITOK);
+ 	nv = kalloc_data(((h.nv_len + 511) & ~511u) + 512, Z_WAITOK);
+@@ -1289,7 +1300,12 @@ vince_pronto_boot(void)
+ 	 * nothing at all starts it but HAL_START answers 38. An attempt whose WCNSS_CTRL does not show up within 5 s is
+ 	 * stopped (PAS SHUTDOWN) and the firmware reloaded for the next.
+ 	 */
+-	{
++	if (restart) {
++		st = vp_scm(2, 6, 1, VP_PAS_ID, 0, 0, &res);    /* PAS SHUTDOWN of the running firmware */
++		printf("VINCE PRONTO: restart: SHUTDOWN status %lld result %llu, setup mode %d\n", st, res, vp_good_mode);
++		vince_smd_sleep(200);
++	}
++	if (!restart) {
+ 		int rpm = 1;
+ 		(void)PE_parse_boot_argn("vincerpm", &rpm, sizeof(rpm));
+ 		if (rpm) {
+@@ -1305,8 +1321,8 @@ vince_pronto_boot(void)
+ 	int only = -1, nmodes = (int)(sizeof(modes) / sizeof(modes[0]));
+ 	(void)PE_parse_boot_argn("vinceiris", &only, sizeof(only));
+ 	for (int m = 0; m < nmodes; m++) {
+-		int mode = only >= 0 ? only : modes[m];
+-		if (only >= 0 && m > 0) {
++		int mode = vp_good_mode >= 0 ? vp_good_mode : only >= 0 ? only : modes[m];
++		if ((only >= 0 || vp_good_mode >= 0) && m > 0) {
+ 			break;
+ 		}
+ 		if (vp_phys(VP_FW_PA, NULL, (h.fw_span + 3) & ~3u)) {
+@@ -1352,6 +1368,8 @@ vince_pronto_boot(void)
+ 		}
+ 		printf("VINCE PRONTO: Pronto started (mode %d)\n", mode);
+ 		if (vp_ctrl(nv, h.nv_len) != -1) {
++			vp_good_mode = mode;
++			result = 0;
+ 			break;
+ 		}
+ 		/* no WCNSS_CTRL: the firmware's crash reason, if it wrote one, then stop it for the next attempt */
+@@ -1374,9 +1392,13 @@ vince_pronto_boot(void)
+ 		printf("VINCE PRONTO: SHUTDOWN status %lld result %llu\n", st, res);
+ 		vince_smd_sleep(200);
+ 	}
+-	if (h.nv_len > 4) {
++	if (h.nv_len > 4 && result == 0) {
++		if (vince_pronto_nv) {
++			kfree_data((void *)(uintptr_t)vince_pronto_nv, vince_pronto_nv_alloc);
++		}
+ 		vince_pronto_nv = nv;           /* kept for the WLAN HAL (not freed below) */
+ 		vince_pronto_nv_len = h.nv_len;
++		vince_pronto_nv_alloc = ((h.nv_len + 511) & ~511u) + 512;
+ 		nv = NULL;
+ 	}
+ out:
+@@ -1389,6 +1411,36 @@ out:
+ 	if (nv) {
+ 		kfree_data(nv, ((h.nv_len + 511) & ~511u) + 512);
+ 	}
++	return result;
++}
++
++static bool vp_active;
++
++static void
++vince_pronto_boot(void)
++{
++	vp_active = true;
++	(void)vince_pronto_boot_ex(false);
++}
++
++bool vince_pronto_kernel_started(void);
++
++bool
++vince_pronto_kernel_started(void)
++{
++	return vp_active;
++}
++
++/* for vince_wlan.c: restart the firmware ourselves (vincepronto=1); -1 when Pronto was not started by the kernel */
++int vince_pronto_restart(void);
++
++int
++vince_pronto_restart(void)
++{
++	if (!vp_active) {
++		return -1;
++	}
++	return vince_pronto_boot_ex(true) == 0 ? 0 : -2;
+ }
+ 
+ void
+diff --git a/bsd/dev/vince_wlan.c b/bsd/dev/vince_wlan.c
+index afde737..01303ed 100755
+--- a/bsd/dev/vince_wlan.c
++++ b/bsd/dev/vince_wlan.c
+@@ -695,6 +695,9 @@ vw_crash_log(void)
+ 	printf("VINCE WLAN: firmware crash reason: \"%s\"\n", t);
+ }
+ 
++extern int vince_pronto_restart(void);          /* vince_smd.c (0203) */
++extern bool vince_pronto_kernel_started(void);
++
+ /* ask the shim (CPU1 monitor) to restart Pronto; 0 when the firmware is back up with the WCNSS_CTRL handshake done */
+ static int
+ vw_restart_pronto(void)
+@@ -702,6 +705,21 @@ vw_restart_pronto(void)
+ 	uint32_t b0, req;
+ 	uint64_t t0;
+ 
++	{
++		/* 0203: the kernel starts Pronto (vincepronto=1, 0189+), so it restarts it too */
++		if (vince_pronto_kernel_started()) {
++			vw_crash_log();
++			bzero(&vw_ch, sizeof(vw_ch));
++			vw_have_self = false;
++			vd_reset();
++			va_reset();
++			vwpa_stop();
++			vn_link_reset();
++			int rr = vince_pronto_restart();
++			printf("VINCE WLAN: kernel restart of Pronto: %d\n", rr);
++			return rr;
++		}
++	}
+ 	if (!vw_mbx) {
+ 		vw_mbx = (volatile struct vw_mbx *)ml_io_map(MBX_PA, 0x1000);
+ 	}
