@@ -22,6 +22,9 @@ on:
       - "tools/patch_dxb.py"
       - ".github/workflows/xnu-vince.yml"
 
+permissions:
+  contents: write
+
 concurrency:
   group: xnu-${{ github.ref }}
   cancel-in-progress: true
@@ -106,3 +109,21 @@ jobs:
           name: xnu-kernel-vince
           path: out/
           if-no-files-found: warn
+
+      # The kernel also goes to the kernel-builds branch (one commit, replaced each build), so it can be fetched with
+      # plain git where artifact downloads (blob storage) are blocked.
+      - name: Publish kernel to kernel-builds branch
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          test -f out/kernel.development.vince || { echo "no kernel"; exit 0; }
+          rm -rf kb && mkdir kb && cd kb
+          git init -q -b kernel-builds
+          cp ../out/kernel.development.vince ../out/SHA256SUMS .
+          echo "${{ github.sha }}" > SOURCE_COMMIT
+          git add -A
+          git -c user.name=github-actions -c user.email=github-actions@users.noreply.github.com \
+            commit -qm "kernel for ${{ github.sha }}"
+          git push -f "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}" kernel-builds
