@@ -1,0 +1,35 @@
+xnu: 0196 vince Pronto: wait up to 30 s for WCNSS_CTRL
+
+0195 on the phone: RPM switched the Iris rails on (L9, L19 now ON) and the RF
+clock buffers, but with the Iris XO at 48 MHz the firmware still had no
+WCNSS_CTRL after 5 s (no crash reason), and at 19.2 MHz HAL_START answers 38.
+With a powered Iris the firmware may calibrate first: wait vincectrlwait s
+(default 30) and log when the channel appears.
+
+diff --git a/bsd/dev/vince_smd.c b/bsd/dev/vince_smd.c
+index 2c9b1a1..1ab49ce 100644
+--- a/bsd/dev/vince_smd.c
++++ b/bsd/dev/vince_smd.c
+@@ -668,13 +668,20 @@ vp_ctrl(const uint8_t *nv, uint32_t nv_len)
+ 	static uint8_t msg[16 + WC_NV_FRAG], rsp[256];
+ 	int r = -1;
+ 
+-	for (int i = 0; i < 200 && !vince_smd_find("WCNSS_CTRL", &c); i++) {
++	/*
++	 * With the Iris powered and its XO at 48 MHz the firmware may run its RF calibration before it creates the
++	 * channels: wait vincectrlwait seconds (default 30; 0194 gave up after 5 s with no crash reason written).
++	 */
++	int wait_s = 30, waited = 0;
++	(void)PE_parse_boot_argn("vincectrlwait", &wait_s, sizeof(wait_s));
++	for (; waited < wait_s * 40 && !vince_smd_find("WCNSS_CTRL", &c); waited++) {
+ 		vince_smd_sleep(25);
+ 	}
+ 	if (!vince_smd_find("WCNSS_CTRL", &c)) {
+-		printf("VINCE PRONTO: no WCNSS_CTRL channel within 5 s\n");
++		printf("VINCE PRONTO: no WCNSS_CTRL channel within %d s\n", wait_s);
+ 		return -1;
+ 	}
++	printf("VINCE PRONTO: WCNSS_CTRL appeared after %d ms\n", waited * 25);
+ 	for (int i = 0; i < 100 && (r = vince_smd_open(&c)) == -1; i++) {
+ 		vince_smd_sleep(20);
+ 	}
