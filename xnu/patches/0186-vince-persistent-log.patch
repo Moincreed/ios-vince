@@ -1,0 +1,147 @@
+xnu: 0186 vince persistent console log on eMMC
+
+Flush the vince_conlog RAM ring to the last 1 MiB of userdata every 5 s
+(mmcrw=1 only, never under the HFS+ volume), in sweet's SWEETLOG format,
+so the log can be pulled from recovery after a hang or panic.
+
+diff --git a/bsd/dev/vince_mmc.c b/bsd/dev/vince_mmc.c
+index 8df3fb7..203b111 100644
+--- a/bsd/dev/vince_mmc.c
++++ b/bsd/dev/vince_mmc.c
+@@ -32,6 +32,8 @@
+ #include <miscfs/devfs/devfs.h>
+ #include <kern/locks.h>
+ #include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
+ #include <pexpert/pexpert.h>
+ #include <libkern/libkern.h>
+ 
+@@ -44,6 +46,13 @@ extern void vince_input_start(void);
+ /* bsd/dev/vince_ctl.c: clean halt when the shim asks (tools/vince_halt.py) */
+ extern void vince_ctl_start(void);
+ extern void vince_smd_start(void);
++/* osfmk/console/serial_console.c: RAM ring of everything the console prints */
++extern char vince_conlog[1 << 20];
++extern volatile uint64_t vince_conlog_pos;
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern int hz;
++static void vince_log_start(void);
+ 
+ #define SDCC1_PHYS      0x07824000ul    /* MCI core; the SDHCI registers start at +0x900 */
+ #define GCC_SDCC1_PHYS  0x01842000ul    /* SDCC1 BCR, then the apps RCG at +4 */
+@@ -895,6 +904,7 @@ vince_mmc_init(void)
+ 	vm.ready = true;
+ 	printf("VINCE MMC: \"%s\" at sector 0x%llx, %llu MiB, %s, %s (8-bit HS 50 MHz, PIO)\n",
+ 	    want, vm.first, vm.nsect * SECTOR >> 20, fs, vm.rw ? "read-write" : "read-only");
++	vince_log_start();
+ 	sweet_sample_start();
+ 	vince_input_start();
+ 	vince_ctl_start();
+@@ -902,6 +912,105 @@ vince_mmc_init(void)
+ 	return 0;
+ }
+ 
++/*
++ * Persistent console log on eMMC (same on-disk format as sweet's UFS "sweetlog", so tools/sweet-log-pull.sh and
++ * friends read it): the last (1 MiB + 512 B) of the partition hold a header sector
++ *   "SWEETLOG" | u32 version 1 | u32 ring size | u64 total bytes written | u64 sequence
++ * followed by the console ring (vince_conlog) as it is in RAM. Only with mmcrw=1 (writes self-tested), only when the
++ * HFS+ volume ends before that area. Flushed every vincelogsecs (default 5) seconds. Boot-arg vincelog=0 turns it off.
++ */
++#define VLOG_RING       ((uint32_t)sizeof(vince_conlog))
++#define VLOG_SECT       (VLOG_RING / SECTOR)
++static uint64_t vlog_base;      /* partition-relative sector of the header */
++static uint32_t vlog_secs = 5;
++static int vlog_chan;
++
++struct vince_log_header {
++	char magic[8];
++	uint32_t version, size;
++	uint64_t total, seq;
++};
++
++static void
++vince_log_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint64_t flushed = 0, seq = 0;
++
++	printf("VINCE LOG: console log to the last %u KiB of the partition (sector 0x%llx), every %u s\n",
++	    (VLOG_SECT + 1) / 2, vlog_base, vlog_secs);
++	for (;;) {
++		(void)tsleep(&vlog_chan, PZERO, "vincelog", hz * (int)vlog_secs);
++		uint64_t total = vince_conlog_pos;
++		if (total == flushed) {
++			continue;
++		}
++		uint64_t pos = total - flushed >= VLOG_RING ? total - VLOG_RING : flushed;
++		int error = 0;
++
++		lck_mtx_lock(&vince_mmc_lock);
++		while (pos < total && !error) {
++			uint32_t off = (uint32_t)(pos % VLOG_RING);
++			uint32_t sec = off / SECTOR;
++			uint64_t need = ((uint64_t)(off % SECTOR) + (total - pos) + SECTOR - 1) / SECTOR;
++			uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(VLOG_SECT - sec)), (uint64_t)MAX_SECTORS);
++			memcpy(vince_mmc_bounce, vince_conlog + (uint64_t)sec * SECTOR, (size_t)n * SECTOR);
++			error = mmc_write_sectors(vlog_base + 1 + sec, n);
++			pos += (uint64_t)(sec + n) * SECTOR - off;
++		}
++		if (!error) {
++			struct vince_log_header h = {
++				.magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
++				.version = 1, .size = VLOG_RING, .total = total, .seq = ++seq,
++			};
++			bzero(vince_mmc_bounce, SECTOR);
++			memcpy(vince_mmc_bounce, &h, sizeof(h));
++			error = mmc_write_sectors(vlog_base, 1);
++		}
++		lck_mtx_unlock(&vince_mmc_lock);
++		if (error) {
++			printf("VINCE LOG: write failed (%d), stopping\n", error);
++			return;
++		}
++		flushed = total;
++	}
++}
++
++static void
++vince_log_start(void)
++{
++	uint32_t on = 1;
++	thread_t thread;
++
++	PE_parse_boot_argn("vincelog", &on, sizeof(on));
++	if (!on || !vm.rw || vm.nsect < 4 * (VLOG_SECT + 1)) {
++		return;
++	}
++	PE_parse_boot_argn("vincelogsecs", &vlog_secs, sizeof(vlog_secs));
++	if (vlog_secs == 0 || vlog_secs > 60) {
++		vlog_secs = 5;
++	}
++	vlog_base = vm.nsect - (VLOG_SECT + 1);
++
++	/* Never under the HFS+ volume: its size is in the volume header (blockSize @40, totalBlocks @44, BE). */
++	lck_mtx_lock(&vince_mmc_lock);
++	int error = mmc_read_sectors(vm.first + 2, 1);
++	const uint8_t *vh = (const uint8_t *)vince_mmc_bounce;
++	uint64_t vol = 0;
++	if (!error && vh[0] == 'H' && (vh[1] == '+' || vh[1] == 'X')) {
++		uint32_t bsz = (uint32_t)vh[40] << 24 | (uint32_t)vh[41] << 16 | (uint32_t)vh[42] << 8 | vh[43];
++		uint32_t blocks = (uint32_t)vh[44] << 24 | (uint32_t)vh[45] << 16 | (uint32_t)vh[46] << 8 | vh[47];
++		vol = (uint64_t)bsz * blocks / SECTOR;
++	}
++	lck_mtx_unlock(&vince_mmc_lock);
++	if (error || vol == 0 || vol + 2048 > vlog_base) {
++		printf("VINCE LOG: no room past the volume (%llu of %llu sectors), no persistent log\n", vol, vm.nsect);
++		return;
++	}
++	if (kernel_thread_start(vince_log_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
+ /* Root device for rd=mmcroot0, and the mmcprobe=1 check (IOFindBSDRoot). */
+ int vince_mmc_rootdev(dev_t *dev);
+ 
