@@ -1,0 +1,66 @@
+xnu: 0195 vince RPM channel items in the RPM message RAM
+
+0194 on the phone: pm8953 L9 (3.3 V Iris PA) and L19 (1.3 V Iris RF) are off,
+L5/L7 on. rpm_requests (cid 4) was found but its info and FIFO items read as
+0 bytes: their legacy SMEM entries point into another region (aux base, the
+RPM message RAM). Map that region and use them there.
+
+diff --git a/bsd/dev/vince_smd.c b/bsd/dev/vince_smd.c
+index 984a0b7..2c9b1a1 100644
+--- a/bsd/dev/vince_smd.c
++++ b/bsd/dev/vince_smd.c
+@@ -824,6 +824,45 @@ vr_kick(void)
+ 	vince_smd_kick(1u << 0);
+ }
+ 
++/*
++ * A global SMEM item that may live outside SMEM: the legacy table entry's aux base names another region (for the
++ * RPM edge, the RPM message RAM). 0192/0194 on the phone: vince_smd_item() found the rpm_requests entry (cid 4) but
++ * not its info and FIFO items, which are there.
++ */
++static vm_offset_t
++vr_item(uint32_t item, uint32_t *size)
++{
++	static vm_offset_t amap;
++	static uint32_t abase;
++	vm_offset_t a = vince_smd_item(item, size);
++
++	if (a && *size) {
++		return a;
++	}
++	*size = 0;
++	if (item >= 512) {
++		return 0;
++	}
++	uint32_t tb = 0xD0u + item * 16;
++	if (srd32(tb) != 1) {
++		return 0;
++	}
++	uint32_t off = srd32(tb + 4), isz = srd32(tb + 8), aux = srd32(tb + 12) & ~3u;
++	printf("VINCE RPM: item %u: offset %#x size %#x aux base %#x\n", item, off, isz, aux);
++	if (!aux || aux == SMEM_PA || off > 0x10000u || isz > 0x10000u - off) {
++		return 0;
++	}
++	if (!amap || abase != aux) {
++		amap = ml_io_map(aux, 0x10000);
++		abase = aux;
++	}
++	if (!amap) {
++		return 0;
++	}
++	*size = isz;
++	return amap + off;
++}
++
+ static bool
+ vr_find(struct vr_ch *c)
+ {
+@@ -847,7 +886,7 @@ vr_find(struct vr_ch *c)
+ 				continue;
+ 			}
+ 			uint32_t isz = 0, fsz = 0;
+-			vm_offset_t io = vince_smd_item(info[t] + cid, &isz), fo = vince_smd_item(fifo[t] + cid, &fsz);
++			vm_offset_t io = vr_item(info[t] + cid, &isz), fo = vr_item(fifo[t] + cid, &fsz);
+ 			printf("VINCE RPM: rpm_requests cid %u table %d info %u bytes fifo %u bytes\n", cid, t, isz, fsz);
+ 			if (!io || !fo || (isz != 40 && isz != 88) || fsz < 0x100 || (fsz & (fsz - 1))) {
+ 				return false;
