@@ -294,16 +294,26 @@ def make_xr(root):
     set_prop(product, 'artwork-scale-factor', u32(2))
     return root
 
+def make_srgb(root):
+    """--srgb: an sRGB panel, not the iPhone X's P3. With P3 WebKit (Safari) and PosterBoard draw into 10-bit
+    'w30r'/'b3a8' surfaces that CoreAnimation's CPU renderer does not show (blank Safari pages): ios-a5xelte
+    herolte notes, boot-0317. Boot once with mgreset=1 so MobileGestalt drops the cached gamut."""
+    set_prop(find(root, 'product'), 'artwork-display-gamut', cstr('sRGB'))
+    return root
+
 def main():
     parser = argparse.ArgumentParser(description="Generate Vince Apple Device Tree")
     parser.add_argument("output", help="Output .adt file path")
     parser.add_argument("--dump", action="store_true", help="Print human readable tree")
+    parser.add_argument("--srgb", action="store_true", help="sRGB display gamut instead of P3 (Safari pages visible on the CPU renderer)")
     parser.add_argument("--xr", action="store_true", help="iPhone XR screen 828x1792 @2x (faster; boot-args vincefb_lw=828 vincefb_lh=1792)")
     args = parser.parse_args()
 
     root = build_vince_adt()
     if args.xr:
         make_xr(root)
+    if args.srgb:
+        make_srgb(root)
     data = adt.serialize(root)
     with open(args.output, "wb") as f:
         f.write(data)
