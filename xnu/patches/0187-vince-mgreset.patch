@@ -1,0 +1,91 @@
+xnu: 0187 vince mgreset boot-arg
+
+mgreset=1 deletes the MobileGestalt cache after the root volume mounts, so
+artwork/product answers are rebuilt from the current ADT /product node.
+
+diff --git a/bsd/dev/vince_mmc.c b/bsd/dev/vince_mmc.c
+index 203b111..d01f787 100644
+--- a/bsd/dev/vince_mmc.c
++++ b/bsd/dev/vince_mmc.c
+@@ -29,6 +29,7 @@
+ #include <sys/errno.h>
+ #include <sys/proc.h>
+ #include <sys/uio.h>
++#include <sys/vnode.h>
+ #include <miscfs/devfs/devfs.h>
+ #include <kern/locks.h>
+ #include <kern/clock.h>
+@@ -53,6 +54,7 @@ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+ extern int hz;
+ static void vince_log_start(void);
++static void vince_mgreset_start(void);
+ 
+ #define SDCC1_PHYS      0x07824000ul    /* MCI core; the SDHCI registers start at +0x900 */
+ #define GCC_SDCC1_PHYS  0x01842000ul    /* SDCC1 BCR, then the apps RCG at +4 */
+@@ -905,6 +907,7 @@ vince_mmc_init(void)
+ 	printf("VINCE MMC: \"%s\" at sector 0x%llx, %llu MiB, %s, %s (8-bit HS 50 MHz, PIO)\n",
+ 	    want, vm.first, vm.nsect * SECTOR >> 20, fs, vm.rw ? "read-write" : "read-only");
+ 	vince_log_start();
++	vince_mgreset_start();
+ 	sweet_sample_start();
+ 	vince_input_start();
+ 	vince_ctl_start();
+@@ -1011,6 +1014,57 @@ vince_log_start(void)
+ 	}
+ }
+ 
++/*
++ * Boot-arg mgreset=1: delete MobileGestalt's answer cache once the root volume is up, so libMobileGestalt rebuilds
++ * it from the current ADT (it keeps answering artwork/product keys from a cache made under an older /product node,
++ * and SpringBoard then asks CoreUI for assets with the wrong traits). Retries for a while in case the root is still
++ * read-only when the thread first looks; ENOENT means there is nothing to delete.
++ */
++extern struct vnode *rootvnode;
++extern int unlink1(vfs_context_t, vnode_t, user_addr_t, enum uio_seg, int);
++static int vmgr_chan;
++static const char *const vince_mgreset_paths[] = {
++	"/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist",
++};
++
++static void
++vince_mgreset_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	int waited = 0;
++
++	while (rootvnode == NULLVP && waited++ < 600) {
++		(void)tsleep(&vmgr_chan, PZERO, "vincemgr", hz);
++	}
++	for (size_t i = 0; i < sizeof(vince_mgreset_paths) / sizeof(vince_mgreset_paths[0]); i++) {
++		const char *path = vince_mgreset_paths[i];
++		int error = EROFS;
++		for (int tries = 0; tries < 120; tries++) {
++			error = unlink1(vfs_context_kernel(), NULLVP, CAST_USER_ADDR_T(path), UIO_SYSSPACE, 0);
++			if (error == 0 || error == ENOENT) {
++				break;
++			}
++			(void)tsleep(&vmgr_chan, PZERO, "vincemgr", hz);
++		}
++		printf("VINCE MGRESET: %s %s (%d)\n", path,
++		    error == 0 ? "deleted" : error == ENOENT ? "not present" : "NOT deleted", error);
++	}
++}
++
++static void
++vince_mgreset_start(void)
++{
++	uint32_t on = 0;
++	thread_t thread;
++
++	PE_parse_boot_argn("mgreset", &on, sizeof(on));
++	if (!on || !vm.rw) {
++		return;
++	}
++	if (kernel_thread_start(vince_mgreset_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
+ /* Root device for rd=mmcroot0, and the mmcprobe=1 check (IOFindBSDRoot). */
+ int vince_mmc_rootdev(dev_t *dev);
+ 
