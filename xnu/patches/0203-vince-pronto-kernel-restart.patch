@@ -7,7 +7,7 @@ stayed dead for the rest of the boot. Restart it ourselves: PAS SHUTDOWN,
 reload, the setup that worked, WCNSS_CTRL handshake and NV.
 
 diff --git a/bsd/dev/vince_smd.c b/bsd/dev/vince_smd.c
-index 293ed58..2a0d490 100644
+index 293ed58..b6479fa 100644
 --- a/bsd/dev/vince_smd.c
 +++ b/bsd/dev/vince_smd.c
 @@ -1234,10 +1234,18 @@ vince_iris_power(void)
@@ -87,14 +87,15 @@ index 293ed58..2a0d490 100644
  			break;
  		}
  		/* no WCNSS_CTRL: the firmware's crash reason, if it wrote one, then stop it for the next attempt */
-@@ -1374,9 +1392,13 @@ vince_pronto_boot(void)
+@@ -1374,9 +1392,14 @@ vince_pronto_boot(void)
  		printf("VINCE PRONTO: SHUTDOWN status %lld result %llu\n", st, res);
  		vince_smd_sleep(200);
  	}
 -	if (h.nv_len > 4) {
 +	if (h.nv_len > 4 && result == 0) {
 +		if (vince_pronto_nv) {
-+			kfree_data((void *)(uintptr_t)vince_pronto_nv, vince_pronto_nv_alloc);
++			void *old_nv = (void *)(uintptr_t)vince_pronto_nv;
++			kfree_data(old_nv, vince_pronto_nv_alloc);
 +		}
  		vince_pronto_nv = nv;           /* kept for the WLAN HAL (not freed below) */
  		vince_pronto_nv_len = h.nv_len;
@@ -102,7 +103,7 @@ index 293ed58..2a0d490 100644
  		nv = NULL;
  	}
  out:
-@@ -1389,6 +1411,36 @@ out:
+@@ -1389,6 +1412,36 @@ out:
  	if (nv) {
  		kfree_data(nv, ((h.nv_len + 511) & ~511u) + 512);
  	}
