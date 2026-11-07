@@ -1,0 +1,87 @@
+xnu: 0192 vince Pronto: Iris XO setup and NV flag before AUTH_AND_RESET
+
+As mainline qcom_wcnss.c wcnss_start(): set SPARE_OUT bit 25 (NV download
+follows) and configure the Iris RF XO (48 MHz) in the pronto PMU before
+AUTH_AND_RESET. With 0191 the HAL NV was accepted but HAL_START still
+answered status 38.
+
+diff --git a/bsd/dev/vince_smd.c b/bsd/dev/vince_smd.c
+index 1bf21dc..d58cb29 100644
+--- a/bsd/dev/vince_smd.c
++++ b/bsd/dev/vince_smd.c
+@@ -488,6 +488,67 @@ struct vp_hdr {
+ };
+ 
+ static bool vp_smc64 = true;
++
++/*
++ * Before AUTH_AND_RESET, as mainline qcom_wcnss.c wcnss_start(): tell the firmware an NV download follows (spare
++ * register bit 25) and configure the Iris RF chip's XO (pronto PMU, 48 MHz: the HAL_START that worked upstream
++ * reported "vIris_TSMC_4.0 with 48MHz XO"). Pronto PMU block 0x0A21B000 (qcom,pronto reg), PMU_CFG +0x1004,
++ * SPARE_OUT +0x1088. Without these HAL_START answered status 38 on the phone.
++ */
++#define VP_PMU_PA               0x0A21C000u     /* page with PMU_CFG (0x0A21C004) and SPARE_OUT (0x0A21C088) */
++#define VP_PMU_CFG              0x004u
++#define VP_SPARE_OUT            0x088u
++#define PMU_IRIS_XO_CFG         (1u << 3)
++#define PMU_IRIS_XO_EN          (1u << 4)
++#define PMU_GC_BUS_MUX_SEL_TOP  (1u << 5)
++#define PMU_IRIS_XO_CFG_STS     (1u << 6)
++#define PMU_IRIS_RESET          (1u << 7)
++#define PMU_IRIS_RESET_STS      (1u << 8)
++#define PMU_XO_MODE_48          (2u << 1)
++#define SPARE_NVBIN_DLND        (1u << 25)
++
++static bool
++vp_pmu_wait(volatile uint32_t *cfg, uint32_t bit, const char *what)
++{
++	for (int i = 0; i < 200; i++) {
++		if (!(*cfg & bit)) {
++			return true;
++		}
++		vince_smd_sleep(1);
++	}
++	printf("VINCE PRONTO: Iris %s did not finish (PMU_CFG %#x)\n", what, *cfg);
++	return false;
++}
++
++static void
++vp_configure_iris(void)
++{
++	vm_offset_t pmu = ml_io_map(VP_PMU_PA, 0x1000);
++	if (!pmu) {
++		printf("VINCE PRONTO: PMU mapping failed\n");
++		return;
++	}
++	volatile uint32_t *cfg = (volatile uint32_t *)(pmu + VP_PMU_CFG), *spare = (volatile uint32_t *)(pmu + VP_SPARE_OUT);
++	printf("VINCE PRONTO: PMU_CFG %#x SPARE_OUT %#x before Iris setup\n", *cfg, *spare);
++	*spare |= SPARE_NVBIN_DLND;
++	*cfg = 0;
++	uint32_t v = PMU_GC_BUS_MUX_SEL_TOP | PMU_IRIS_XO_EN;
++	*cfg = v;
++	v = (v & ~(3u << 1)) | PMU_XO_MODE_48;
++	*cfg = v;
++	v |= PMU_IRIS_RESET;
++	*cfg = v;
++	bool ok = vp_pmu_wait(cfg, PMU_IRIS_RESET_STS, "reset");
++	v &= ~PMU_IRIS_RESET;
++	*cfg = v;
++	v |= PMU_IRIS_XO_CFG;
++	*cfg = v;
++	ok = vp_pmu_wait(cfg, PMU_IRIS_XO_CFG_STS, "XO configuration") && ok;
++	v &= ~(PMU_GC_BUS_MUX_SEL_TOP | PMU_IRIS_XO_CFG);
++	*cfg = v;
++	vince_smd_sleep(20);
++	printf("VINCE PRONTO: Iris XO set up (48 MHz)%s, PMU_CFG %#x SPARE_OUT %#x\n", ok ? "" : " WITH TIMEOUTS", *cfg, *spare);
++}
+ /* the NV, kept for vince_wlan.c: the WLAN HAL wants it again (DOWNLOAD_NV_REQ) before HAL_START */
+ const uint8_t *vince_pronto_nv;
+ uint32_t vince_pronto_nv_len;
+@@ -760,6 +821,7 @@ vince_pronto_boot(void)
+ 	if (st || res) {
+ 		goto out;
+ 	}
++	vp_configure_iris();
+ 	st = vp_scm(2, 5, 1, VP_PAS_ID, 0, 0, &res);            /* AUTH_AND_RESET */
+ 	printf("VINCE PRONTO: AUTH_AND_RESET status %lld result %llu\n", st, res);
+ 	if (st || res) {
