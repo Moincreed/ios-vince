@@ -1,0 +1,56 @@
+xnu: 0198 vince Pronto: WCSS 5-wire pins (GPIO 76..80) to their Iris function
+
+0197 on the phone: with all Iris rails ON and CX/MX at TURBO, Pronto still
+never came up with the Iris XO at 48 MHz (30 s), and at 19.2 MHz HAL_START
+answered 38. Android/mainline mux GPIO 76..80 to wcss_wlan* (function 1,
+6 mA, pull-up) before starting Pronto; LK leaves them plain GPIOs.
+Boot-arg vincewcsspins=0 skips.
+
+diff --git a/bsd/dev/vince_smd.c b/bsd/dev/vince_smd.c
+index dca5731..e07aebf 100644
+--- a/bsd/dev/vince_smd.c
++++ b/bsd/dev/vince_smd.c
+@@ -1104,6 +1104,31 @@ vr_ldo_log(const char *when)
+ 	printf("%s\n", line);
+ }
+ 
++/*
++ * The 5-wire Pronto <-> Iris interface: GPIO 76..80 to function 1 (wcss_wlan2/1/0, wcss_wlan x2), 6 mA, pull-up,
++ * as the phone's DT wcnss_default / mainline msm8953 wcnss_pin_a. LK leaves them plain GPIOs, so the firmware cannot
++ * reach the Iris: at 48 MHz it never comes up, at 19.2 MHz HAL_START answers 38 (0197 on the phone).
++ * TLMM GPIO_CFG(n) = 0x01000000 + 0x1000 n: pull [1:0] (3 = up), function [5:2], drive [8:6] (mA / 2 - 1).
++ */
++static void
++vp_wcss_pins(void)
++{
++	vm_offset_t tlmm = ml_io_map(0x01000000u + 76u * 0x1000u, 5u * 0x1000u);
++	if (!tlmm) {
++		printf("VINCE PRONTO: TLMM mapping failed\n");
++		return;
++	}
++	uint32_t before[5], after[5];
++	for (uint32_t i = 0; i < 5; i++) {
++		volatile uint32_t *cfg = (volatile uint32_t *)(tlmm + i * 0x1000u);
++		before[i] = *cfg;
++		*cfg = (before[i] & ~0x1ffu) | (2u << 6) | (1u << 2) | 3u;
++		after[i] = *cfg;
++	}
++	printf("VINCE PRONTO: WCSS pins GPIO76..80 cfg %#x %#x %#x %#x %#x -> %#x %#x %#x %#x %#x\n",
++	    before[0], before[1], before[2], before[3], before[4], after[0], after[1], after[2], after[3], after[4]);
++}
++
+ static void
+ vince_iris_power(void)
+ {
+@@ -1204,6 +1229,11 @@ vince_pronto_boot(void)
+ 		if (rpm) {
+ 			vince_iris_power();
+ 		}
++		int pins = 1;
++		(void)PE_parse_boot_argn("vincewcsspins", &pins, sizeof(pins));
++		if (pins) {
++			vp_wcss_pins();
++		}
+ 	}
+ 	static const int modes[] = { 3, 2, 6, 0 };
+ 	int only = -1, nmodes = (int)(sizeof(modes) / sizeof(modes[0]));
