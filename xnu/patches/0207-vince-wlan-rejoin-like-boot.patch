@@ -1,0 +1,38 @@
+xnu: 0207 vince Wi-Fi: every join starts like the first one after boot
+
+On the phone (0206): the first WPA2 join after boot works (a minute of
+traffic, Safari loads 1.1.1.1), every later one - after a disconnect, or
+just after a restart - makes the firmware assert at SET_LINK(POSTASSOC),
+with either post-association timing. Restart Pronto after every link end,
+and after a restart run the boot-time scan (self station, DXE, probes)
+instead of only the self station, so each join follows the path that works.
+
+diff --git a/bsd/dev/vince_wlan.c b/bsd/dev/vince_wlan.c
+index 709df0d..a94737b 100755
+--- a/bsd/dev/vince_wlan.c
++++ b/bsd/dev/vince_wlan.c
+@@ -1308,7 +1308,13 @@ vui_assoc(const struct vui_assoc *a, int stage)
+ 	vui_link_event(true, 0, why == VIF_END_CMD, why == VIF_END_LOST ? 2 : 3);
+ 	vif_a80211_event(2, NULL, 0);
+ 	vif_a80211_event(3, NULL, 0);
+-	return why == VIF_END_FWCRASH || (lr <= -2 && lr >= -5) || vw_fw_crashed();
++	/*
++	 * 0207: on the phone only the first join after boot passed; every later one (after a disconnect, or right
++	 * after a restart) made the firmware assert at SET_LINK(POSTASSOC). Restart Pronto after every link end so
++	 * each join starts like the boot one.
++	 */
++	(void)lr;
++	return 1;
+ }
+ 
+ static void
+@@ -1425,7 +1431,8 @@ vui_loop(int stage)
+ 			vui_set_state(VUI_S_INIT);
+ 			int tries;
+ 			for (tries = 0; tries < 3; tries++) {
+-				if (!vw_restart_pronto() && !vw_bringup(stage) && !vw_prepare(NULL)) {
++				/* 0207: as at boot: bring-up, then the scan (which does the self station and DXE) */
++				if (!vw_restart_pronto() && !vw_bringup(stage) && !vw_scan_all()) {
+ 					break;
+ 				}
+ 				printf("VINCE UI: Wi-Fi restart attempt %d failed\n", tries + 1);
