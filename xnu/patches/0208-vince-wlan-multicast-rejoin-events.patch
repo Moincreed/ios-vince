@@ -1,0 +1,85 @@
+xnu: 0208 vince Wi-Fi: receive multicast; tell wifid after a restart
+
+On the phone every received frame in every log was unicast to us: the
+firmware passed no multicast (no IPv6 router advertisements, so no IPv6;
+no mDNS). Send WCN36XX_HAL_8023_MULTICAST_LIST_REQ with an empty list after
+each join - all multicast received (mainline wcn36xx_smd_set_mc_list).
+After a Pronto restart also post POWER_CHANGED and SCAN_DONE so wifid
+joins again without waiting.
+
+diff --git a/bsd/dev/vince_wlan.c b/bsd/dev/vince_wlan.c
+index a94737b..b78494d 100755
+--- a/bsd/dev/vince_wlan.c
++++ b/bsd/dev/vince_wlan.c
+@@ -1263,6 +1263,7 @@ vui_assoc(const struct vui_assoc *a, int stage)
+ 			return 0;
+ 		}
+ 	}
++	(void)va_allow_multicast();
+ 	lck_mtx_lock(vui_lk);
+ 	vui_i.state = VUI_S_RUN;
+ 	vui_i.ssid_len = a->ssid_len;
+@@ -1444,6 +1445,12 @@ vui_loop(int stage)
+ 			}
+ 			vif_ui_up();
+ 			vif_a80211_event(55, NULL, 0);          /* APPLE80211_M_DRIVER_AVAILABLE */
++			/*
++			 * 0208: the restart's scan just found the networks around; tell wifid at once (power, scan done) so its
++			 * auto-join runs now - on the phone it waited well after the driver was back before joining again.
++			 */
++			vif_a80211_event(1, NULL, 0);           /* APPLE80211_M_POWER_CHANGED */
++			vif_a80211_event(10, NULL, 0);          /* APPLE80211_M_SCAN_DONE */
+ 		}
+ 	}
+ }
+diff --git a/bsd/dev/vince_wlan.h b/bsd/dev/vince_wlan.h
+index 2f72236..5c7c32a 100755
+--- a/bsd/dev/vince_wlan.h
++++ b/bsd/dev/vince_wlan.h
+@@ -99,6 +99,7 @@ uint32_t va_own_rsn(uint8_t *out);
+ int va_reconfigure_ccmp(const struct vd_bss *ap);       /* after the 4-way handshake, as wcn36xx_set_key() */
+ int va_install_ptk(const uint8_t tk[16]);
+ int va_install_gtk(uint8_t keyid, const uint8_t gtk[16]);
++int va_allow_multicast(void);           /* 0208: all multicast to us (IPv6 RA, mDNS) */
+ /*
+  * Leave: deauthentication (va_leave only), then the firmware side in mainline order: remove keys, delete station,
+  * delete BSS, link idle. full = 0 only sets the link idle (old behaviour, leaves the firmware in a state that wedges
+diff --git a/bsd/dev/vince_wlan_assoc.c b/bsd/dev/vince_wlan_assoc.c
+index 0c5ebec..b4d1e86 100644
+--- a/bsd/dev/vince_wlan_assoc.c
++++ b/bsd/dev/vince_wlan_assoc.c
+@@ -627,6 +627,34 @@ int va_install_ptk(const uint8_t tk[16])
+ 	return e;
+ }
+ 
++/*
++ * 0208: WCN36XX_HAL_8023_MULTICAST_LIST_REQ (157) with an empty list for the joined BSS - "an empty list means all
++ * mc traffic will be received" (mainline wcn36xx_smd_set_mc_list). Without it the firmware passed no multicast at
++ * all (no IPv6 router advertisements, no mDNS: on the phone every received frame was unicast to us).
++ */
++int va_allow_multicast(void);
++
++int
++va_allow_multicast(void)
++{
++	static struct __attribute__((packed)) {
++		uint8_t data_offset;
++		uint32_t mc_addr_count;
++		uint8_t mc_addr[240][6];
++		uint8_t bss_index;
++	} b;
++	uint32_t status = 0;
++
++	if (s_last.bss_index == 0xff) {
++		return -1;
++	}
++	memset(&b, 0, sizeof(b));
++	b.bss_index = s_last.bss_index;
++	int e = vw_cmd(157, &b, sizeof(b), &status);
++	printf("VINCE WLAN: multicast list (all multicast) for bss %u: %d status %u\n", s_last.bss_index, e, status);
++	return e;
++}
++
+ int va_install_gtk(uint8_t keyid, const uint8_t gtk[16])
+ {
+ 	static struct wcn36xx_hal_set_bss_key_req_msg m;
