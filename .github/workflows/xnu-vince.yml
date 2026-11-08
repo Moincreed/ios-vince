@@ -69,6 +69,41 @@ jobs:
           xcodebuild -version
           xcrun --find iig
 
+      # The Kernel Debug Kit (~650 MB, GitHub release asset of dortania/KdkSupportPkg) is downloaded by build.sh with
+      # no retry or check; two runs in a row failed with "hdiutil: attach failed - image not recognized". Cache it,
+      # and download with retries + sha256 check, then install it so build.sh skips its own download.
+      - name: Cache Kernel Debug Kit
+        id: kdk-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/kdk-cache
+          key: kdk-${{ env.MACOS_VERSION }}-v1
+
+      - name: Fetch and install Kernel Debug Kit
+        run: |
+          set -e
+          NAME=$(grep -A3 "'${MACOS_VERSION}')" dxb/build.sh | sed -n "s/.*KDK_NAME='\(.*\)'.*/\1/p" | head -1)
+          ROOT=$(grep -A3 "'${MACOS_VERSION}')" dxb/build.sh | sed -n "s/.*KDKROOT='\(.*\)'.*/\1/p" | head -1)
+          echo "KDK: $NAME -> $ROOT"
+          [ -d "$ROOT" ] && { echo "already installed"; exit 0; }
+          MAN=$(curl -fsSL --retry 5 https://raw.githubusercontent.com/dortania/KdkSupportPkg/gh-pages/manifest.json)
+          URL=$(echo "$MAN" | jq -r --arg n "$NAME" '.[] | select(.name==$n) | .url')
+          SHA=$(echo "$MAN" | jq -r --arg n "$NAME" '.[] | select(.name==$n) | .sha256sum')
+          mkdir -p ~/kdk-cache
+          DMG=~/kdk-cache/KDK.dmg
+          for i in 1 2 3 4 5; do
+            if [ -f "$DMG" ] && [ "$(shasum -a 256 "$DMG" | cut -d' ' -f1)" = "$SHA" ]; then break; fi
+            echo "download attempt $i"
+            rm -f "$DMG"
+            curl -fL --retry 3 --connect-timeout 60 --max-time 1200 -o "$DMG" "$URL" || true
+            sleep 10
+          done
+          [ "$(shasum -a 256 "$DMG" | cut -d' ' -f1)" = "$SHA" ] || { echo "KDK download failed checksum"; ls -la "$DMG"; head -c 300 "$DMG"; exit 1; }
+          hdiutil attach "$DMG"
+          sudo installer -pkg '/Volumes/Kernel Debug Kit/KernelDebugKit.pkg' -target /
+          hdiutil detach '/Volumes/Kernel Debug Kit'
+          ls -lah /Library/Developer/KDKs
+
       - name: Build XNU Kernel for Vince
         working-directory: dxb
         env:
